@@ -36,16 +36,18 @@ def _ensure_db():
 def index():
     rows = core.list_shipments(db())
     summary = {}
+    from datetime import datetime
     for s in rows:
-        summary[s["id"]] = {
-            "open": db().execute(
-                "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? AND status != 'resolved'",
-                (s["id"],)).fetchone()[0],
-            "reconciled": db().execute(
-                "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? "
-                "AND status != 'resolved' AND is_reconciled = 1",
-                (s["id"],)).fetchone()[0],
-        }
+        open_n = db().execute(
+            "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? AND status != 'resolved'",
+            (s["id"],)).fetchone()[0]
+        reconciled_n = db().execute(
+            "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? "
+            "AND status != 'resolved' AND is_reconciled = 1",
+            (s["id"],)).fetchone()[0]
+        dl = core.parse_dt(s["deadline"])
+        overdue = bool(open_n and dl and datetime.now() > dl)
+        summary[s["id"]] = {"open": open_n, "reconciled": reconciled_n, "overdue": overdue}
     return render_template("index.html", shipments=rows, summary=summary,
                            status_labels={"open": "处理中", "resolved": "已完结"})
 
@@ -59,12 +61,29 @@ def new_shipment():
             customer=request.form.get("customer", ""),
             description=request.form.get("description", ""),
             actor=request.form.get("actor", ""),
+            deadline=request.form.get("deadline") or None,
+            warn_hours=request.form.get("warn_hours", "24"),
         )
     except Exception as e:
         flash(f"建票失败：{e}", "error")
         return redirect(url_for("index"))
     flash(f"货票已创建（#{sid}），请录入三方资料", "ok")
     return redirect(url_for("detail", shipment_id=sid))
+
+
+@app.route("/shipments/<int:shipment_id>/deadline", methods=["POST"])
+def update_deadline(shipment_id):
+    try:
+        core.set_deadline(
+            db(), shipment_id,
+            deadline=request.form.get("deadline") or None,
+            warn_hours=request.form.get("warn_hours", "24"),
+            actor=request.form.get("actor", ""),
+        )
+        flash("截止时间已更新", "ok")
+    except Exception as e:
+        flash(f"截止时间更新失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
 
 
 # ---------------------------------------------------------------- 一票货详情
@@ -110,13 +129,41 @@ def detail(shipment_id):
             "values": json.loads(d["values_json"]),
         })
     logs = core.list_logs(conn, shipment_id)
+    tokens = core.list_tokens(conn, shipment_id)
+    reminder_rows = list(conn.execute(
+        """SELECT e.*, n.target, n.status AS nstatus, n.attempts
+           FROM reminder_event e JOIN notification n ON n.event_id = e.id
+           WHERE e.shipment_id = ? ORDER BY e.id DESC, n.id""",
+        (shipment_id,)))
+    # 截止时间风险状态（与 reminders.py 同一判定口径）
+    deadline_risk = _deadline_risk(shipment, cards)
     return render_template(
         "detail.html",
         s=shipment, docs=docs, table=table, cards=cards, logs=logs,
+        tokens=tokens, reminders=reminder_rows, deadline_risk=deadline_risk,
         sources=core.SOURCES, source_labels=core.SOURCE_LABELS,
         field_labels=core.FIELD_LABELS,
         status_labels={"open": "待认领", "claimed": "处理中", "resolved": "已解决"},
     )
+
+
+def _deadline_risk(shipment, cards):
+    dl = core.parse_dt(shipment["deadline"])
+    if dl is None:
+        return None
+    unresolved = [c for c in cards if c["row"]["status"] != "resolved"]
+    if not unresolved:
+        return None
+    from datetime import datetime, timedelta
+    now_dt = datetime.now()
+    if now_dt > dl:
+        return {"level": "overdue", "text": "已超过报关截止，差异仍未解决（已升级主管）",
+                "cls": "b-open"}
+    if now_dt >= dl - timedelta(hours=int(shipment["warn_hours"])):
+        return {"level": "due_soon",
+                "text": f"已进入 {shipment['warn_hours']} 小时提醒窗口，临近报关截止",
+                "cls": "b-claimed"}
+    return None
 
 
 # ---------------------------------------------------------------- 资料录入
@@ -197,6 +244,69 @@ def resolve(discrepancy_id):
     except Exception as e:
         flash(f"解决失败：{e}", "error")
     return redirect(url_for("detail", shipment_id=sid))
+
+
+# ------------------------------------------------------------ 供应商补件链接
+
+@app.route("/shipments/<int:shipment_id>/tokens", methods=["POST"])
+def create_token(shipment_id):
+    fields = request.form.getlist("fields")
+    try:
+        token = core.create_supplement_token(
+            db(), shipment_id, fields=fields,
+            contact=request.form.get("contact", ""),
+            actor=request.form.get("actor", ""),
+        )
+        link = url_for("portal", token=token, _external=True)
+        flash(f"补件链接已生成：{link}（只含被授权字段，可发给供应商）", "ok")
+    except Exception as e:
+        flash(f"生成补件链接失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
+
+
+@app.route("/tokens/<int:token_id>/revoke", methods=["POST"])
+def revoke_token(token_id):
+    conn = db()
+    row = conn.execute("SELECT shipment_id FROM supplement_token WHERE id = ?",
+                       (token_id,)).fetchone()
+    sid = row["shipment_id"] if row else None
+    try:
+        core.revoke_token(conn, token_id, actor=request.form.get("actor", ""))
+        flash("补件链接已吊销", "ok")
+    except Exception as e:
+        flash(f"吊销失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=sid))
+
+
+# ------------------------------------------------------------ 供应商受限门户
+
+def _portal_page(token, error=None, just_submitted=None):
+    conn = db()
+    try:
+        ctx = core.portal_context(conn, token)
+    except core.TokenError as e:
+        return render_template("portal_error.html", message=str(e)), 403
+    return render_template("portal.html", ctx=ctx, error=error,
+                           just_submitted=just_submitted,
+                           field_labels=core.FIELD_LABELS)
+
+
+@app.route("/portal/<token>")
+def portal(token):
+    return _portal_page(token)
+
+
+@app.route("/portal/<token>/submit", methods=["POST"])
+def portal_submit(token):
+    # 只收集三个已知字段；任何额外字段名若混入会在 core 层按越权/非法拒绝
+    values = {f: request.form.get(f, "") for f in core.FIELDS if f in request.form}
+    try:
+        result = core.supplier_submit(db(), token, values, actor=request.form.get("actor", ""))
+    except core.TokenError as e:
+        return _portal_page(token, error=str(e)), 403
+    if result["duplicate"]:
+        return _portal_page(token, error="提交内容与现行版本一致，已按重复提交忽略，未新增资料版本。")
+    return _portal_page(token, just_submitted=result["changed_fields"])
 
 
 if __name__ == "__main__":

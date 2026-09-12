@@ -1,9 +1,12 @@
-"""单元测试：比对引擎、幂等（版本更新/重复提交不产生第二条差异）、认领/补件/解决约束、Flask 冒烟。"""
+"""单元测试：比对引擎、幂等（版本更新/重复提交不产生第二条差异）、认领/补件/解决约束、
+截止提醒/升级（防刷屏、故障隔离）、供应商受限门户、Flask 冒烟。"""
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 import core
+import reminders
 
 
 class CoreTest(unittest.TestCase):
@@ -124,6 +127,188 @@ class CoreTest(unittest.TestCase):
         for a in ("shipment_created", "doc_submitted", "discrepancy_opened",
                   "discrepancy_claimed", "discrepancy_supplemented"):
             self.assertIn(a, actions)
+
+
+class DeadlineTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "d.db"))
+        core.init_db(self.conn)
+        self.t0 = datetime(2026, 9, 15, 9, 0)
+        self.deadline = self.t0 + timedelta(hours=2)
+        self.sid = core.create_shipment(
+            self.conn, "DL-1", actor="t",
+            deadline=self.deadline.isoformat(timespec="minutes"), warn_hours=1)
+        core.submit_document(self.conn, self.sid, "supplier", "A", "1", "C", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "B", "1", "C", actor="t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _disc_ids(self):
+        return [d["id"] for d in core.list_discrepancies(self.conn, self.sid)]
+
+    def test_no_reminder_before_window(self):
+        stats = reminders.scan_once(self.conn, reminders.LogNotifier(), at=self.t0)
+        self.assertEqual(stats["events_new"], 0)
+
+    def test_due_soon_and_escalation_no_spam(self):
+        # 临近：每条差异一条 due_soon 事件
+        s1 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.t0 + timedelta(hours=1))
+        self.assertEqual((s1["events_new"], s1["notified"], s1["failed"]), (1, 1, 0))
+        # 重复扫描：不产生新事件、不发消息
+        s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.t0 + timedelta(hours=1, minutes=10))
+        self.assertEqual((s2["events_new"], s2["notified"]), (0, 0))
+        self.assertEqual(s2["suppressed"], 1)
+        # 超时：升级，每差异一条 overdue 事件
+        s3 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.deadline + timedelta(minutes=1))
+        self.assertEqual(s3["events_new"], 1)
+        self.assertEqual(s3["notified"], 1)  # 未认领 → 只通知主管
+        # 再扫：拦截
+        s4 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.deadline + timedelta(minutes=5))
+        self.assertEqual(s4["notified"], 0)
+
+    def test_claimed_discrepancy_notifies_owner_and_lead_when_overdue(self):
+        did = self._disc_ids()[0]
+        core.claim_discrepancy(self.conn, did, owner="小李")
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.deadline + timedelta(minutes=1))
+        targets = {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT n.target FROM notification n JOIN reminder_event e ON n.event_id=e.id "
+            "WHERE e.discrepancy_id=? AND e.level='overdue'", (did,))}
+        self.assertEqual(targets, {"小李", "关务主管"})
+
+    def test_resolved_discrepancy_silent(self):
+        did = self._disc_ids()[0]
+        core.claim_discrepancy(self.conn, did, owner="小李")
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1", "C", actor="t")
+        d = next(x for x in core.list_discrepancies(self.conn, self.sid) if x["id"] == did)
+        core.resolve_discrepancy(self.conn, did, actor="小李")
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.deadline + timedelta(hours=1))
+        self.assertEqual(s["events_new"], 0)
+
+    def test_notifier_failure_isolated_and_retried(self):
+        flaky = reminders.FlakyNotifier(fail_times=1)
+        s1 = reminders.scan_once(self.conn, flaky, at=self.deadline + timedelta(minutes=1))
+        self.assertGreaterEqual(s1["failed"], 1)
+        # 失败期间核心流程照常用
+        did = self._disc_ids()[0]
+        core.claim_discrepancy(self.conn, did, owner="小李")
+        core.add_supplement(self.conn, did, note="处理中", actor="小李")
+        # 下次扫描自动重试失败通知
+        s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.deadline + timedelta(minutes=10))
+        self.assertGreaterEqual(s2["retried_ok"], 1)
+        self.assertEqual(s2["failed"], 0)
+
+    def test_new_episode_after_reopen_reminds_once(self):
+        did = self._disc_ids()[0]
+        # 第一轮超时升级
+        reminders.scan_once(self.conn, reminders.LogNotifier(),
+                            at=self.deadline + timedelta(minutes=1))
+        # 改齐并解决
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1", "C", actor="t")
+        core.resolve_discrepancy(self.conn, did, actor="t")
+        # 再冲突 → 复用行，episode 2，允许再提醒一次
+        core.submit_document(self.conn, self.sid, "forwarder", "Z", "1", "C", actor="t")
+        row = self.conn.execute("SELECT episode,status FROM discrepancy WHERE id=?",
+                                (did,)).fetchone()
+        self.assertEqual(row["episode"], 2)
+        self.assertEqual(row["status"], "open")
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.deadline + timedelta(hours=2))
+        self.assertEqual(s["events_new"], 1)
+        s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.deadline + timedelta(hours=3))
+        self.assertEqual(s2["events_new"], 0)
+
+
+class PortalTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "p.db"))
+        core.init_db(self.conn)
+        self.sid = core.create_shipment(self.conn, "P-1", actor="t")
+        core.submit_document(self.conn, self.sid, "supplier", "保温杯", "1000", "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "真空保温杯", "1020", "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "warehouse", "保温杯", "1000", "C9", actor="t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_portal_context_hides_other_sources(self):
+        token = core.create_supplement_token(self.conn, self.sid, ["quantity"],
+                                             contact="小王", actor="小张")
+        ctx = core.portal_context(self.conn, token)
+        blob = repr(ctx)
+        self.assertNotIn("真空保温杯", blob)   # 货代品名不可见
+        self.assertNotIn("C9", blob)          # 仓库箱单号不可见
+        self.assertNotIn("1020", blob)        # 货代数量不可见
+        self.assertEqual(ctx["allowed_fields"], ["quantity"])
+        # 只暴露数量差异（品名/箱单虽冲突但不在授权字段内）
+        self.assertEqual([d["field"] for d in ctx["open_discrepancies"]], ["quantity"])
+
+    def test_forbidden_field_rejected_and_logged(self):
+        token = core.create_supplement_token(self.conn, self.sid, ["quantity"], actor="小张")
+        with self.assertRaises(core.TokenError):
+            core.supplier_submit(self.conn, token, {"carton_no": "C99"}, actor="供应商")
+        # 供应商资料未被动到
+        self.assertEqual(core.get_document(self.conn, self.sid, "supplier")["carton_no"], "C1")
+        actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        self.assertIn("portal_denied", actions)
+
+    def test_submit_attaches_and_recomputes_and_dedupes(self):
+        token = core.create_supplement_token(
+            self.conn, self.sid, ["product_name", "quantity"], actor="小张")
+        r1 = core.supplier_submit(self.conn, token, {"quantity": "1020"}, actor="小王")
+        self.assertFalse(r1["duplicate"])
+        self.assertEqual(r1["version"], 2)
+        # 只更新授权字段，其他字段保留
+        doc = core.get_document(self.conn, self.sid, "supplier")
+        self.assertEqual((doc["product_name"], doc["quantity"], doc["carton_no"]),
+                         ("保温杯", "1020", "C1"))
+        # 数量差异（货代也是 1020，仓库仍是 1000）——三方未齐，不会误判为一致
+        qty = next(d for d in core.list_discrepancies(self.conn, self.sid)
+                   if d["field"] == "quantity")
+        self.assertEqual(qty["is_reconciled"], 0)
+
+        # 仓库改齐后自动核对一致
+        core.submit_document(self.conn, self.sid, "warehouse", "保温杯", "1020", "C9", actor="t")
+        qty = next(d for d in core.list_discrepancies(self.conn, self.sid)
+                   if d["field"] == "quantity")
+        self.assertEqual(qty["is_reconciled"], 1)
+
+        # 重复提交：不升版
+        r2 = core.supplier_submit(self.conn, token, {"quantity": "1020"}, actor="小王")
+        self.assertTrue(r2["duplicate"])
+        self.assertEqual(core.get_document(self.conn, self.sid, "supplier")["version"], 2)
+        tok = self.conn.execute("SELECT used_count FROM supplement_token WHERE token=?",
+                                (token,)).fetchone()
+        self.assertEqual(tok["used_count"], 1)
+
+    def test_revoked_and_expired_token(self):
+        token = core.create_supplement_token(self.conn, self.sid, ["quantity"], actor="t")
+        row = self.conn.execute("SELECT id FROM supplement_token WHERE token=?",
+                                (token,)).fetchone()
+        core.revoke_token(self.conn, row["id"], actor="t")
+        with self.assertRaises(core.TokenError):
+            core.supplier_submit(self.conn, token, {"quantity": "1"}, actor="t")
+
+        token2 = core.create_supplement_token(
+            self.conn, self.sid, ["quantity"], actor="t", expires_in_hours=-1)
+        with self.assertRaises(core.TokenError):
+            core.portal_context(self.conn, token2)
+
+    def test_blank_fields_not_cleared(self):
+        token = core.create_supplement_token(self.conn, self.sid, ["quantity"], actor="t")
+        with self.assertRaises(core.TokenError):
+            core.supplier_submit(self.conn, token, {"quantity": "  "}, actor="小王")
+        self.assertEqual(core.get_document(self.conn, self.sid, "supplier")["quantity"], "1000")
 
 
 class FlaskSmokeTest(unittest.TestCase):

@@ -14,6 +14,53 @@
       </span>
     </div>
   </div>
+  <div class="meta" style="margin-top:8px">
+    <div>报关截止：
+      {% if s['deadline'] %}<b class="{{ 'cell-conflict' if deadline_risk and deadline_risk.level == 'overdue' }}">{{ s['deadline'].replace('T',' ') }}</b>
+      （提前 {{ s['warn_hours'] }} 小时提醒）
+      {% else %}<span class="muted">未设置</span>{% endif %}
+    </div>
+    {% if deadline_risk %}<span class="badge {{ deadline_risk.cls }}">⏰ {{ deadline_risk.text }}</span>{% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>截止时间与提醒升级</h2>
+  <form method="post" action="{{ url_for('update_deadline', shipment_id=s['id']) }}">
+    <div class="grid g4">
+      <div><label>报关截止时间</label><input type="datetime-local" name="deadline" value="{{ s['deadline'] or '' }}"></div>
+      <div><label>提前提醒（小时）</label><input type="number" name="warn_hours" value="{{ s['warn_hours'] }}" min="1"></div>
+      <div><label>操作人</label><input name="actor" placeholder="姓名"></div>
+      <div style="display:flex;align-items:flex-end"><button type="submit" class="ghost">保存</button></div>
+    </div>
+  </form>
+  <p class="muted" style="margin:10px 0 0">提醒服务（<code>reminders.py</code>）独立运行：进入提醒窗口后每条未解决差异提醒一次负责人；超时后自动升级通知关务主管。同一风险轮次内不重复发送；差异解决后再次冲突才开启新一轮。通知渠道故障不影响资料录入。</p>
+  {% if reminders %}
+  <table style="margin-top:12px">
+    <tr><th>差异字段</th><th>级别</th><th>轮次</th><th>通知对象</th><th>投递状态</th><th>产生时间</th></tr>
+    {% for r in reminders %}
+    <tr>
+      <td>
+        {% set fname = namespace(v='') %}
+        {% for c in cards %}{% if c.row['id'] == r['discrepancy_id'] %}{% set fname.v = field_labels[c.row['field']] %}{% endif %}{% endfor %}
+        {{ fname.v or '#' ~ r['discrepancy_id'] }}
+      </td>
+      <td>
+        {% if r['level'] == 'overdue' %}<span class="badge b-open">已超时（升级）</span>
+        {% else %}<span class="badge b-claimed">临近截止</span>{% endif %}
+      </td>
+      <td>第 {{ r['episode'] }} 轮</td>
+      <td>{{ r['target'] }}</td>
+      <td>
+        {% if r['nstatus'] == 'sent' %}<span class="badge b-resolved">已发送</span>
+        {% elif r['nstatus'] == 'failed' %}<span class="badge b-open">发送失败·重试 {{ r['attempts'] }} 次</span>
+        {% else %}<span class="badge b-claimed">待发送</span>{% endif %}
+      </td>
+      <td class="muted">{{ r['created_at'].replace('T',' ') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -157,6 +204,51 @@
     {% endif %}
   </div>
   {% endfor %}
+</div>
+
+<div class="card">
+  <h2>供应商补件链接（限定货票 + 限定字段，看不到货代/仓库数据）</h2>
+  <form method="post" action="{{ url_for('create_token', shipment_id=s['id']) }}">
+    <div class="grid g4">
+      <div>
+        <label>允许供应商修改的字段（可多选）</label>
+        <select name="fields" multiple size="3" style="height:auto">
+          {% for f in ['product_name','quantity','carton_no'] %}
+          <option value="{{ f }}">{{ field_labels[f] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div><label>供应商联系人/称呼</label><input name="contact" placeholder="如 小王 / 供应商A"></div>
+      <div><label>签发人</label><input name="actor" placeholder="姓名"></div>
+      <div style="display:flex;align-items:flex-end"><button type="submit">生成补件链接</button></div>
+    </div>
+  </form>
+  {% if tokens %}
+  <table style="margin-top:12px">
+    <tr><th>允许字段</th><th>联系人</th><th>有效期至</th><th>使用</th><th>状态</th><th>链接 / 操作</th></tr>
+    {% for t in tokens %}
+    <tr>
+      <td>
+        {% for f in t['fields'].split(',') %}<span class="badge b-claimed">{{ field_labels[f] }}</span> {% endfor %}
+      </td>
+      <td>{{ t['contact'] or '—' }}</td>
+      <td class="muted">{{ t['expires_at'].replace('T',' ') if t['expires_at'] else '长期' }}</td>
+      <td class="muted">已用 {{ t['used_count'] }} 次{% if t['last_used_at'] %}<br>{{ t['last_used_at'].replace('T',' ') }}{% endif %}</td>
+      <td>{% if t['revoked'] %}<span class="badge b-open">已吊销</span>{% else %}<span class="badge b-resolved">有效</span>{% endif %}</td>
+      <td>
+        {% if not t['revoked'] %}
+        <a href="{{ url_for('portal', token=t['token']) }}">打开补件页</a>
+        <form class="inline" method="post" action="{{ url_for('revoke_token', token_id=t['id']) }}"
+              onsubmit="return confirm('确定吊销该补件链接？');">
+          <input type="hidden" name="actor" value="">
+          <button type="submit" class="ghost" style="padding:3px 10px">吊销</button>
+        </form>
+        {% else %}—{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
 </div>
 
 <div class="card">

@@ -7,13 +7,10 @@
       <div><label>货票编号 *</label><input name="ref" required placeholder="如 SH-20260912-01"></div>
       <div><label>客户</label><input name="customer" placeholder="客户名称"></div>
       <div><label>货描</label><input name="description" placeholder="航线/品名概览"></div>
-      <div>
-        <label>操作人</label>
-        <div style="display:flex;gap:8px;">
-          <input name="actor" placeholder="姓名" style="flex:1">
-          <button type="submit">建票</button>
-        </div>
-      </div>
+      <div><label>操作人</label><input name="actor" placeholder="姓名"></div>
+      <div><label>报关截止时间</label><input type="datetime-local" name="deadline"></div>
+      <div><label>提前提醒（小时）</label><input type="number" name="warn_hours" value="24" min="1"></div>
+      <div style="display:flex;align-items:flex-end"><button type="submit" style="width:100%">建票</button></div>
     </div>
   </form>
 </div>
@@ -22,7 +19,7 @@
   <h2>货票列表</h2>
   {% if shipments %}
   <table>
-    <tr><th>#</th><th>货票编号</th><th>客户</th><th>未解决差异</th><th>状态</th><th>创建时间</th><th></th></tr>
+    <tr><th>#</th><th>货票编号</th><th>客户</th><th>未解决差异</th><th>报关截止</th><th>状态</th><th></th></tr>
     {% for s in shipments %}
     <tr>
       <td>{{ s['id'] }}</td>
@@ -36,8 +33,10 @@
           {% endif %}
         {% else %}<span class="muted">无</span>{% endif %}
       </td>
+      <td class="{{ 'cell-conflict' if summary[s['id']]['overdue'] else '' }}">
+        {% if s['deadline'] %}{{ s['deadline'].replace('T', ' ') }}{% else %}<span class="muted">未设置</span>{% endif %}
+      </td>
       <td><span class="badge b-{{ s['status'] }}">{{ status_labels[s['status']] }}</span></td>
-      <td class="muted">{{ s['created_at'] }}</td>
       <td><a href="{{ url_for('detail', shipment_id=s['id']) }}">进入处理 →</a></td>
     </tr>
     {% endfor %}
@@ -45,5 +44,4 @@
   {% else %}
   <p class="muted">还没有货票，先在上方建一票。</p>
   {% endif %}
-</div>
-{% endblock %}
+</div>{% endblock %}

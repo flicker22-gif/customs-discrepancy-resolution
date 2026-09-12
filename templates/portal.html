@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>供应商补件 - {{ ctx.shipment['ref'] }}</title>
+  <style>
+    body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+           background:#f4f6f9; color:#1f2933; }
+    header { background:#1f618d; color:#fff; padding:16px 24px; font-size:17px; font-weight:600; }
+    .wrap { max-width:760px; margin:24px auto; padding:0 16px; }
+    .card { background:#fff; border:1px solid #d9dee7; border-radius:8px; padding:20px 22px; margin-bottom:16px; }
+    h2 { margin:0 0 14px; font-size:16px; }
+    label { display:block; font-size:12px; color:#6b7280; margin:10px 0 4px; }
+    input { width:100%; padding:8px 10px; border:1px solid #d9dee7; border-radius:5px; font-size:14px; }
+    button { background:#1f618d; color:#fff; border:0; border-radius:5px; padding:9px 22px;
+             font-size:14px; cursor:pointer; margin-top:16px; }
+    .flash { padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:14px; }
+    .flash.ok { background:#e9f7ef; color:#1e8449; }
+    .flash.error { background:#fdecec; color:#c0392b; }
+    .muted { color:#6b7280; font-size:12px; }
+    .meta { font-size:14px; line-height:1.9; }
+    .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; }
+    .b-open { background:#fdecec; color:#c0392b; }
+    .b-reconciled { background:#e9f7ef; color:#1e8449; border:1px solid #1e8449; }
+    table { width:100%; border-collapse:collapse; font-size:14px; margin-top:6px; }
+    th,td { border:1px solid #d9dee7; padding:8px 10px; text-align:left; }
+    th { background:#eef2f7; }
+    .lock { color:#6b7280; font-size:12px; margin-top:14px; }
+  </style>
+</head>
+<body>
+  <header>供应商报关资料补件</header>
+  <div class="wrap">
+    {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+    {% if just_submitted %}
+    <div class="flash ok">补件已提交（更新字段：{% for x in just_submitted %}{{ x }}{% if not loop.last %}、{% endif %}{% endfor %}），系统已自动挂回对应差异并重新核对。</div>
+    {% endif %}
+
+    <div class="card">
+      <h2>货票信息</h2>
+      <div class="meta">
+        货票编号：<b>{{ ctx.shipment['ref'] }}</b><br>
+        {% if ctx.shipment['deadline'] %}报关截止：<b>{{ ctx.shipment['deadline'].replace('T',' ') }}</b><br>{% endif %}
+        本链接允许你补正的字段：
+        <b>{% for f in ctx.allowed_fields %}{{ field_labels[f] }}{% if not loop.last %}、{% endif %}{% endfor %}</b>
+      </div>
+      <div class="lock">🔒 此页面为受限补件入口：只能修改上述字段，无法查看货代、仓库提交的资料。</div>
+    </div>
+
+    <div class="card">
+      <h2>我方（供应商）当前资料</h2>
+      <table>
+        <tr>
+          {% for f in ctx.allowed_fields %}<th>{{ field_labels[f] }}</th>{% endfor %}
+        </tr>
+        <tr>
+          {% for f in ctx.allowed_fields %}
+          <td>
+            {% if ctx.document and ctx.document[f] not in (none, '') %}
+              {{ ctx.document[f] }} <span class="muted">v{{ ctx.document['version'] }}</span>
+            {% else %}<span class="muted">尚未提交</span>{% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+      </table>
+
+      {% if ctx.open_discrepancies %}
+      <h2 style="margin-top:18px">待你核实的字段</h2>
+      {% for d in ctx.open_discrepancies %}
+      <p style="margin:6px 0;font-size:14px">
+        <b>【{{ d.label }}】</b>
+        {% if d.is_reconciled %}<span class="badge b-reconciled">已核对一致，等待内部确认</span>
+        {% else %}<span class="badge b-open">三方比对不一致，请核实补正</span>{% endif %}
+      </p>
+      {% endfor %}
+      {% endif %}
+
+      <form method="post" action="{{ url_for('portal_submit', token=ctx.token['token']) }}">
+        {% for f in ctx.allowed_fields %}
+        <label>{{ field_labels[f] }}{% if ctx.document and ctx.document[f] not in (none, '') %}（留空则保持现值 {{ ctx.document[f] }}）{% endif %}</label>
+        <input name="{{ f }}"
+               value="{{ ctx.document[f] if ctx.document and ctx.document[f] not in (none, '') else '' }}"
+               placeholder="请填写正确的{{ field_labels[f] }}">
+        {% endfor %}
+        <label>提交人（可选）</label>
+        <input name="actor" placeholder="你的姓名" style="max-width:240px">
+        <div><button type="submit">提交补件并自动核对</button></div>
+      </form>
+      <p class="muted" style="margin-top:12px">内容没有变化时重复点击提交不会产生新版本；提交后差异会自动挂回并重新核对。</p>
+    </div>
+  </div>
+</body>
+</html>

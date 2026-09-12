@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}{{ s['ref'] }} - 差异核对{% endblock %}
+{% block body %}
+<p><a href="{{ url_for('index') }}">← 返回列表</a></p>
+
+<div class="card">
+  <div class="meta">
+    <div>货票：<b>{{ s['ref'] }}</b></div>
+    <div>客户：<b>{{ s['customer'] or '—' }}</b></div>
+    <div>货描：{{ s['description'] or '—' }}</div>
+    <div>整体状态：
+      <span class="badge b-{{ s['status'] }}">
+        {{ '已完结（全部差异解决）' if s['status'] == 'resolved' else '处理中' }}
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>三方资料对照（自动比对：品名 / 数量 / 箱单号）</h2>
+  <table>
+    <tr><th style="width:110px;">字段</th>
+        {% for src in sources %}<th>{{ source_labels[src] }}</th>{% endfor %}
+        <th style="width:110px;">比对结果</th></tr>
+    {% for row in table %}
+    <tr>
+      <td><b>{{ row.label }}</b></td>
+      {% for c in row.cells %}
+      <td class="{{ 'cell-conflict' if row.conflict and not c.missing }} {{ 'cell-missing' if c.missing }}">
+        {% if c.missing %}未提交{% else %}{{ c.value }}{% endif %}
+        {% if c.doc %}<span class="ver">v{{ c.doc['version'] }} · {{ c.doc['submitted_at'] }}</span>{% endif %}
+      </td>
+      {% endfor %}
+      <td>
+        {% if row.discrepancy and row.discrepancy['status'] == 'resolved' %}
+          <span class="badge b-resolved">已解决</span>
+        {% elif row.discrepancy and row.discrepancy['is_reconciled'] %}
+          <span class="badge b-reconciled">✓ 核对一致，待确认</span>
+        {% elif row.conflict %}
+          <span class="badge b-open">✗ 不一致</span>
+        {% else %}
+          <span class="muted">一致 / 待齐套</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted" style="margin-bottom:0">说明：仅一方提交时不产生差异；至少两方提交且归一化后不一致才算冲突（数量忽略千分位/小数尾零，品名与箱单号忽略空格与大小写）。</p>
+</div>
+
+<div class="card">
+  <h2>录入 / 更新资料</h2>
+  <form method="post" action="{{ url_for('submit_doc', shipment_id=s['id']) }}">
+    <div class="grid g4">
+      <div>
+        <label>资料来源</label>
+        <select name="source">
+          {% for src in sources %}<option value="{{ src }}">{{ source_labels[src] }}</option>{% endfor %}
+        </select>
+      </div>
+      <div><label>品名</label><input name="product_name" placeholder="如 不锈钢保温杯"></div>
+      <div><label>数量</label><input name="quantity" placeholder="如 1000"></div>
+      <div><label>箱单号</label><input name="carton_no" placeholder="如 CBMU1234567"></div>
+    </div>
+    <div class="actions">
+      <div class="grow"><label>提交人</label><input name="actor" placeholder="姓名（留痕用）"></div>
+      <button type="submit">提交并自动比对</button>
+    </div>
+    <p class="muted" style="margin-bottom:0">同一来源重复提交相同内容会被忽略；内容有变化则升版本并复用原差异行，不会产生第二条。</p>
+  </form>
+  <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+  <form class="inline" method="post" action="{{ url_for('recompute', shipment_id=s['id']) }}">
+    <label>补件改单后，可按当前最新版本整体重新核对</label>
+    <div class="actions">
+      <div class="grow"><input name="actor" placeholder="操作人（可选）"></div>
+      <button type="submit" class="ghost">重新核对全部字段</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>差异清单（{{ cards|length }} 条，每条字段唯一，版本更新复用同一行）</h2>
+  {% if not cards %}
+    <p class="muted">当前没有差异。提交两方以上且字段不一致的资料后会自动出现。</p>
+  {% endif %}
+  {% for c in cards %}
+  {% set d = c.row %}
+  <div class="disc {{ 'resolved' if d['status'] == 'resolved' else ('reconciled' if d['is_reconciled'] else '') }}">
+    <div>
+      <b>【{{ field_labels[d['field']] }}】</b>
+      <span class="badge b-{{ d['status'] }}">{{ status_labels[d['status']] }}</span>
+      {% if d['is_reconciled'] and d['status'] != 'resolved' %}
+        <span class="badge b-reconciled">✓ 已核对一致</span>
+      {% endif %}
+      {% if d['owner'] %}<span class="muted">负责人：{{ d['owner'] }}</span>{% endif %}
+    </div>
+    <div class="vals">
+      <table>
+        <tr>{% for src in sources %}<th>{{ source_labels[src] }}</th>{% endfor %}</tr>
+        <tr>
+          {% for src in sources %}
+          <td>
+            {% if src in c['values'] %}
+              「{{ c['values'][src]['raw'] }}」<span class="ver">v{{ c['values'][src]['version'] }}</span>
+            {% else %}<span class="cell-missing">未提交</span>{% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+      </table>
+    </div>
+    {% if d['supplement_note'] %}
+    <div style="font-size:13px;margin:6px 0"><b>补件记录：</b><pre style="white-space:pre-wrap;margin:4px 0;font-family:inherit">{{ d['supplement_note'] }}</pre></div>
+    {% endif %}
+    <div class="muted">
+      首次发现 {{ d['first_found_at'] }}
+      {% if d['reconciled_at'] %}· 核对一致于 {{ d['reconciled_at'] }}{% endif %}
+      {% if d['resolved_at'] %}· 解决于 {{ d['resolved_at'] }}{% endif %}
+    </div>
+
+    {% if d['status'] != 'resolved' %}
+    <div class="actions">
+      {% if not d['owner'] %}
+      <form class="inline grow" method="post" action="{{ url_for('claim', discrepancy_id=d['id']) }}">
+        <label>认领</label>
+        <div class="actions" style="margin-top:0">
+          <div class="grow"><input name="owner" placeholder="负责人姓名"></div>
+          <button type="submit">认领</button>
+        </div>
+      </form>
+      {% else %}
+      <form class="inline grow" method="post" action="{{ url_for('claim', discrepancy_id=d['id']) }}">
+        <label>转交</label>
+        <div class="actions" style="margin-top:0">
+          <div class="grow"><input name="owner" value="{{ d['owner'] }}"></div>
+          <button type="submit" class="ghost">更新负责人</button>
+        </div>
+      </form>
+      {% endif %}
+      <form class="inline grow" method="post" action="{{ url_for('supplement', discrepancy_id=d['id']) }}">
+        <label>补件说明（追加留痕）</label>
+        <div class="actions" style="margin-top:0">
+          <div class="grow"><input name="note" placeholder="如 已向供应商索取更正版 PL"></div>
+          <input type="hidden" name="actor" value="{{ d['owner'] or '' }}">
+          <button type="submit" class="ghost">补件</button>
+        </div>
+      </form>
+      {% if d['is_reconciled'] %}
+      <form class="inline" method="post" action="{{ url_for('resolve', discrepancy_id=d['id']) }}">
+        <label>&nbsp;</label>
+        <div class="actions" style="margin-top:0">
+          <input type="hidden" name="actor" value="{{ d['owner'] or '' }}">
+          <button type="submit" class="green">确认已解决</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>操作留痕</h2>
+  <ul class="logs">
+    {% for l in logs %}
+    <li><span class="logt">{{ l['created_at'] }}</span><b>{{ l['actor'] }}</b> · {{ l['detail'] }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

@@ -93,30 +93,42 @@ def assess_shipments(conn: sqlite3.Connection, at: datetime | None = None) -> li
 
 # ---------------------------------------------------------------- 扫描
 
+DEFAULT_ESCALATION_TARGET = "关务主管"
+
+
+def _clean_target(escalation_target: str | None) -> str:
+    target = (escalation_target or "").strip()
+    return target or DEFAULT_ESCALATION_TARGET
+
+
 def scan_once(conn: sqlite3.Connection, notifier: Notifier,
-              escalation_target: str = "关务主管", at: datetime | None = None) -> dict:
+              escalation_target: str = DEFAULT_ESCALATION_TARGET,
+              at: datetime | None = None) -> dict:
     """扫描一轮：去重产生提醒事件 → 投递通知（新事件+失败重试）。
 
+    escalation_target: 超时升级联系人（未认领差异的临近提醒也兜底发给他）。
     统计 {"events_new": n, "notified": n, "failed": n, "retried_ok": n, "suppressed": n}
     """
     at = at or datetime.now()
+    target_name = _clean_target(escalation_target)
     stats = {"events_new": 0, "notified": 0, "failed": 0, "retried_ok": 0, "suppressed": 0}
 
     for item in assess_shipments(conn, at):
         s, level = item["shipment"], item["level"]
         for d in item["discrepancies"]:
-            event = _ensure_event(conn, d, level, at)
+            event = _ensure_event(conn, d, level, at, target_name)
             if event["is_new"]:
                 stats["events_new"] += 1
             elif not event["has_pending_or_failed"]:
                 stats["suppressed"] += 1  # 本轮同级别已成功通知 → 刷屏拦截
 
     conn.commit()
-    _deliver_pending(conn, notifier, escalation_target, stats)
+    _deliver_pending(conn, notifier, stats)
     return stats
 
 
-def _ensure_event(conn, discrepancy, level, at) -> dict:
+def _ensure_event(conn, discrepancy, level, at,
+                  escalation_target: str = DEFAULT_ESCALATION_TARGET) -> dict:
     """幂等创建提醒事件（UNIQUE(discrepancy_id, level, episode) 兜底防重）。"""
     existing = conn.execute(
         "SELECT id FROM reminder_event WHERE discrepancy_id = ? AND level = ? AND episode = ?",
@@ -135,7 +147,7 @@ def _ensure_event(conn, discrepancy, level, at) -> dict:
          at.isoformat(timespec="seconds")),
     )
     event_id = cur.lastrowid
-    _create_notifications(conn, event_id, discrepancy, level)
+    _create_notifications(conn, event_id, discrepancy, level, escalation_target)
     core_shipment_log = (
         f"提醒升级：差异【{core.FIELD_LABELS[discrepancy['field']]}】"
         f"{LEVEL_LABELS[level]}（第 {discrepancy['episode']} 轮）")
@@ -146,15 +158,19 @@ def _ensure_event(conn, discrepancy, level, at) -> dict:
     return {"id": event_id, "is_new": True, "has_pending_or_failed": True}
 
 
-def _create_notifications(conn, event_id, discrepancy, level) -> None:
-    """临近：通知负责人（未认领则关务主管）；超时：必然升级给关务主管。"""
+def _create_notifications(conn, event_id, discrepancy, level,
+                          escalation_target: str = DEFAULT_ESCALATION_TARGET) -> None:
+    """通知规则（不因自定义联系人而改变）：
+    - 临近：通知负责人；未认领则兜底通知升级联系人；
+    - 超时：通知负责人（如有）+ 必然升级给 escalation_target。
+    """
     targets = []
     if level == LEVEL_DUE_SOON:
-        targets.append((discrepancy["owner"] or "关务主管", "owner_or_lead"))
+        targets.append((discrepancy["owner"] or escalation_target, "owner_or_lead"))
     else:
         if discrepancy["owner"]:
             targets.append((discrepancy["owner"], "owner"))
-        targets.append(("关务主管", "escalation"))
+        targets.append((escalation_target, "escalation"))
 
     s = conn.execute("SELECT ref, deadline FROM shipment WHERE id = ?",
                      (discrepancy["shipment_id"],)).fetchone()
@@ -179,7 +195,7 @@ def _create_notifications(conn, event_id, discrepancy, level) -> None:
             (event_id, target, content, core.now()))
 
 
-def _deliver_pending(conn, notifier, escalation_target, stats) -> None:
+def _deliver_pending(conn, notifier, stats) -> None:
     rows = conn.execute(
         "SELECT n.*, e.discrepancy_id FROM notification n JOIN reminder_event e ON n.event_id = e.id "
         "WHERE n.status IN ('pending','failed') ORDER BY n.id").fetchall()
@@ -203,10 +219,10 @@ def _deliver_pending(conn, notifier, escalation_target, stats) -> None:
         conn.commit()
 
 
-def retry_failed(conn: sqlite3.Connection, notifier) -> dict:
-    """显式重试所有失败通知。"""
+def retry_failed(conn: sqlite3.Connection, notifier: Notifier) -> dict:
+    """显式重试所有失败/待发通知（升级联系人在事件创建时已固化在通知记录里）。"""
     stats = {"events_new": 0, "notified": 0, "failed": 0, "retried_ok": 0, "suppressed": 0}
-    _deliver_pending(conn, notifier, "关务主管", stats)
+    _deliver_pending(conn, notifier, stats)
     return stats
 
 
@@ -217,15 +233,19 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="扫描一轮后退出")
     parser.add_argument("--loop", action="store_true", help="持续运行")
     parser.add_argument("--interval", type=int, default=60, help="循环扫描间隔秒数")
+    parser.add_argument("--escalation-target",
+                        default=os.environ.get("ESCALATION_TARGET", DEFAULT_ESCALATION_TARGET),
+                        help="超时升级联系人（默认：关务主管；也可用环境变量 ESCALATION_TARGET）")
     args = parser.parse_args()
 
     conn = core.connect(os.environ.get("CUSTOMS_DB"))
     core.init_db(conn)
     notifier = LogNotifier()
+    target = _clean_target(args.escalation_target)
 
     def run():
-        stats = scan_once(conn, notifier)
-        print(f"[{core.now()}] 扫描完成：新事件 {stats['events_new']}，"
+        stats = scan_once(conn, notifier, escalation_target=target)
+        print(f"[{core.now()}] 扫描完成（升级联系人：{target}）：新事件 {stats['events_new']}，"
               f"发出 {stats['notified']}，失败 {stats['failed']}，"
               f"重试成功 {stats['retried_ok']}，拦截重复 {stats['suppressed']}")
 

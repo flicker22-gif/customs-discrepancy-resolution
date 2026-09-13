@@ -17,6 +17,9 @@
 pip install -r requirements.txt        # 仅需 Flask（Python 3.10+）
 python3 app.py                         # Web：http://localhost:5000
 python3 reminders.py --loop --interval 60   # 提醒/升级服务（独立进程，也可 cron 每分钟调 --once）
+# 超时升级联系人可配置（默认“关务主管”），通知规则不变（临近给负责人/未认领兜底给主管；超时给负责人+主管）：
+python3 reminders.py --once --escalation-target "值班主管周"
+ESCALATION_TARGET="值班主管周" python3 reminders.py --loop
 ```
 
 - SQLite 数据库自动建在 `data/customs.db`（可用环境变量 `CUSTOMS_DB` 覆盖）。
@@ -28,7 +31,7 @@ python3 reminders.py --loop --interval 60   # 提醒/升级服务（独立进程
 python3 demo.py                        # 第一期：两处冲突→认领→重复提交→补件→重核→解决
 python3 demo2.py                       # 第二期：提醒/升级、防刷屏、通知故障隔离、供应商补件门户
 python3 demo3.py                       # 第三期：申报包冻结、新版本不改旧包、多包并存、带差异冻结
-python3 -m unittest test_core -v       # 29 个单元/HTTP 冒烟测试
+python3 -m unittest test_core -v       # 34 个单元/HTTP 冒烟测试
 ```
 
 ## 业务流程

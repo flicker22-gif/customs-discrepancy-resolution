@@ -129,6 +129,20 @@ class CoreTest(unittest.TestCase):
             self.assertIn(a, actions)
 
 
+class RecordingNotifier(reminders.Notifier):
+    """记录 (target, content) 的通知器，可按需抛错。"""
+
+    def __init__(self, fail_times=0):
+        self.sent_to = []
+        self.remaining = fail_times
+
+    def send(self, target, subject, content):
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise ConnectionError("网关超时（模拟）")
+        self.sent_to.append((target, content))
+
+
 class DeadlineTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -226,6 +240,84 @@ class DeadlineTest(unittest.TestCase):
         s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
                                  at=self.deadline + timedelta(hours=3))
         self.assertEqual(s2["events_new"], 0)
+
+    # ---- 自定义超时升级联系人 ----
+    def _notification_targets(self, did, level):
+        return {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT n.target FROM notification n "
+            "JOIN reminder_event e ON n.event_id=e.id "
+            "WHERE e.discrepancy_id=? AND e.level=?", (did, level))}
+
+    def test_custom_escalation_target_overdue_claimed(self):
+        did = self._disc_ids()[0]
+        core.claim_discrepancy(self.conn, did, owner="小李")
+        n = RecordingNotifier()
+        s = reminders.scan_once(self.conn, n, escalation_target="值班主管周",
+                                at=self.deadline + timedelta(minutes=1))
+        self.assertEqual(s["notified"], 2)
+        self.assertEqual(self._notification_targets(did, "overdue"),
+                         {"小李", "值班主管周"})
+        # 固定默认联系人不得出现
+        self.assertTrue(all(t != reminders.DEFAULT_ESCALATION_TARGET for t, _ in n.sent_to))
+
+    def test_custom_target_unclaimed_due_soon_fallback(self):
+        did = self._disc_ids()[0]  # 未认领
+        n = RecordingNotifier()
+        reminders.scan_once(self.conn, n, escalation_target="值班主管周",
+                            at=self.t0 + timedelta(hours=1, minutes=30))
+        targets = {t for t, _ in n.sent_to}
+        self.assertEqual(targets, {"值班主管周"})  # 临近+未认领 → 兜底给自定义主管
+
+    def test_default_escalation_target_unchanged(self):
+        did = self._disc_ids()[0]
+        n = RecordingNotifier()
+        reminders.scan_once(self.conn, n,
+                            at=self.deadline + timedelta(minutes=1))
+        self.assertEqual({t for t, _ in n.sent_to}, {"关务主管"})
+        self.assertEqual(self._notification_targets(did, "overdue"), {"关务主管"})
+
+    def test_custom_target_dedup_on_repeated_scans(self):
+        did = self._disc_ids()[0]
+        n = RecordingNotifier()
+        at = self.deadline + timedelta(minutes=1)
+        s1 = reminders.scan_once(self.conn, n, escalation_target="值班主管周", at=at)
+        s2 = reminders.scan_once(self.conn, n, escalation_target="值班主管周",
+                                 at=at + timedelta(minutes=5))
+        s3 = reminders.scan_once(self.conn, n, escalation_target="值班主管周",
+                                 at=at + timedelta(minutes=10))
+        self.assertEqual(s1["events_new"], 1)
+        self.assertEqual((s2["events_new"], s2["notified"], s2["suppressed"]), (0, 0, 1))
+        self.assertEqual((s3["events_new"], s3["notified"]), (0, 0))
+        # 无论扫几遍，值班主管只收到一条
+        self.assertEqual([t for t, _ in n.sent_to], ["值班主管周"])
+
+    def test_custom_target_failed_then_retried(self):
+        did = self._disc_ids()[0]
+        at = self.deadline + timedelta(minutes=1)
+        flaky = RecordingNotifier(fail_times=1)
+        s1 = reminders.scan_once(self.conn, flaky, escalation_target="值班主管周", at=at)
+        self.assertEqual(s1["failed"], 1)
+        self.assertEqual(flaky.sent_to, [])
+        # 下一轮用新通知器重试：目标必须仍是创建时固化的自定义联系人
+        n2 = RecordingNotifier()
+        s2 = reminders.scan_once(self.conn, n2, escalation_target="值班主管周",
+                                 at=at + timedelta(minutes=5))
+        self.assertEqual(s2["retried_ok"], 1)
+        self.assertEqual([t for t, _ in n2.sent_to], ["值班主管周"])
+        # 新差异（数量开始冲突）产生新事件，按本轮传入的新主管投递；旧事件不重复
+        n3 = RecordingNotifier()
+        core.submit_document(self.conn, self.sid, "forwarder", "B", "2", "C", actor="t")
+        s3 = reminders.scan_once(self.conn, n3, escalation_target="代班主管吴",
+                                 at=at + timedelta(minutes=10))
+        self.assertEqual(s3["events_new"], 1)
+        targets3 = {t for t, _ in n3.sent_to}
+        self.assertEqual(targets3, {"代班主管吴"})  # 本轮只有新事件待发
+        # 旧事件的通知记录目标在创建时固化，换主管也不被改写
+        old_targets = {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT n.target FROM notification n "
+            "JOIN reminder_event e ON n.event_id=e.id "
+            "WHERE e.discrepancy_id=? AND e.level='overdue' AND e.episode=1", (did,))}
+        self.assertEqual(old_targets, {"值班主管周"})
 
 
 class PortalTest(unittest.TestCase):

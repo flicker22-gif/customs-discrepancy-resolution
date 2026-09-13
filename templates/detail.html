@@ -252,6 +252,42 @@
 </div>
 
 <div class="card">
+  <h2>申报包冻结与导出（不可变快照）</h2>
+  <p class="muted" style="margin-top:0">冻结会把<b>当前采用的三方资料版本</b>（含提交人、提交时间）和<b>全部差异处理结论</b>（负责人、补件、留痕、风险提示）固化为一个申报包。冻结后三方再提交新版本，本包内容不会改变；需要新快照时再冻结下一包。</p>
+  <form method="post" action="{{ url_for('freeze_package', shipment_id=s['id']) }}">
+    <div class="actions">
+      <div class="grow"><label>冻结操作人</label><input name="actor" placeholder="姓名"></div>
+      <div class="grow" style="flex:2">
+        <label>带未解决差异冻结（默认阻止；确认后风险会写入申报包并留痕）</label>
+        <label style="font-size:13px;color:#1f2933;display:flex;align-items:center;gap:6px;margin-top:8px">
+          <input type="checkbox" name="confirm_open" value="1" style="width:auto">
+          我确认在仍有未解决差异的情况下带差异申报，自行承担风险
+        </label>
+      </div>
+      <button type="submit" class="green">冻结当前状态为申报包</button>
+    </div>
+  </form>
+  {% if packages %}
+  <table style="margin-top:14px">
+    <tr><th>包号</th><th>冻结时间</th><th>冻结人</th><th>冻结时采用值</th><th>遗留未解决</th><th>导出</th></tr>
+    {% for p in packages %}
+    <tr>
+      <td><b>#{{ p['package_no'] }}</b></td>
+      <td class="muted">{{ p['frozen_at'].replace('T',' ') }}</td>
+      <td>{{ p['frozen_by'] }}</td>
+      <td style="font-size:12px">{{ p['declared_fields'] }}</td>
+      <td>{% if p['open_items'] %}<span class="badge b-open">{{ p['open_items'] }} 处（带差异申报）</span>{% else %}<span class="badge b-resolved">0</span>{% endif %}</td>
+      <td>
+        <a href="{{ url_for('export_package', package_id=p['id'], fmt='md') }}">下载核对单 .md</a> ·
+        <a href="{{ url_for('export_package', package_id=p['id'], fmt='json') }}">原始快照 .json</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>操作留痕</h2>
   <ul class="logs">
     {% for l in logs %}

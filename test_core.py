@@ -311,6 +311,111 @@ class PortalTest(unittest.TestCase):
         self.assertEqual(core.get_document(self.conn, self.sid, "supplier")["quantity"], "1000")
 
 
+class PackageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "pkg.db"))
+        core.init_db(self.conn)
+        self.sid = core.create_shipment(self.conn, "PK-1", customer="甲", actor="t",
+                                        deadline="2026-09-20T10:00", warn_hours=24)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _submit_all(self, pname=("保温杯",) * 3, qty=("1000",) * 3, cno=("C1",) * 3):
+        core.submit_document(self.conn, self.sid, "supplier", pname[0], qty[0], cno[0], actor="王")
+        core.submit_document(self.conn, self.sid, "forwarder", pname[1], qty[1], cno[1], actor="陈")
+        core.submit_document(self.conn, self.sid, "warehouse", pname[2], qty[2], cno[2], actor="赵")
+
+    def test_freeze_blocked_with_open_discrepancy(self):
+        self._submit_all(qty=("1000", "1020", "1000"))
+        with self.assertRaises(ValueError):
+            core.freeze_package(self.conn, self.sid, actor="李")
+        # 显式确认可带差异冻结
+        r = core.freeze_package(self.conn, self.sid, actor="李", confirm=True)
+        self.assertEqual(r["open_items"], 1)
+        pkgs = core.list_packages(self.conn, self.sid)
+        self.assertEqual(len(pkgs), 1)
+        self.assertEqual(pkgs[0]["open_items"], 1)
+
+    def test_clean_freeze_snapshot_content_and_sources(self):
+        self._submit_all()
+        r = core.freeze_package(self.conn, self.sid, actor="李")
+        self.assertEqual(r["open_items"], 0)
+        pid = core.list_packages(self.conn, self.sid)[0]["id"]
+        pkg = core.get_package(self.conn, pid)
+        for f in core.FIELDS:
+            e = pkg["declared_fields"][f]
+            self.assertTrue(e["all_agree"])
+            self.assertEqual(len(e["basis_sources"]), 3)
+        self.assertEqual(pkg["declared_fields"]["quantity"]["adopted_value"], "1000")
+        # 来源、版本、提交人、时间都在快照里
+        fwd = pkg["documents"]["forwarder"]
+        self.assertEqual((fwd["submitted_by"], fwd["version"]), ("陈", 1))
+        self.assertTrue(fwd["submitted_at"])
+
+    def test_frozen_package_immutable_after_new_versions(self):
+        self._submit_all()
+        core.freeze_package(self.conn, self.sid, actor="李")
+        pid = core.list_packages(self.conn, self.sid)[0]["id"]
+        before = core.get_package(self.conn, pid)
+
+        # 冻结后：产生差异、改齐、三方一致换值，多次升版
+        self._submit_all(qty=("999",) * 3)              # 全部更新到 999
+        self._submit_all(qty=("1000",) * 3)             # 再改回 1000（重复判定在全表上，这里确有变化）
+        self._submit_all(cno=("C2",) * 3)               # 箱单号整体改成 C2
+
+        after = core.get_package(self.conn, pid)
+        self.assertEqual(after, before)                # 旧包字节级不变
+        self.assertEqual(after["declared_fields"]["carton_no"]["adopted_value"], "C1")
+
+    def test_multiple_packages_independent(self):
+        self._submit_all(cno=("C1",) * 3)
+        core.freeze_package(self.conn, self.sid, actor="李")
+        self._submit_all(cno=("C2",) * 3)
+        core.freeze_package(self.conn, self.sid, actor="李")
+        pkgs = core.list_packages(self.conn, self.sid)
+        self.assertEqual([p["package_no"] for p in pkgs], [1, 2])
+        p1 = core.get_package(self.conn, pkgs[0]["id"])
+        p2 = core.get_package(self.conn, pkgs[1]["id"])
+        self.assertEqual(p1["declared_fields"]["carton_no"]["adopted_value"], "C1")
+        self.assertEqual(p2["declared_fields"]["carton_no"]["adopted_value"], "C2")
+        self.assertEqual(p1["frozen_at"], p1["frozen_at"])
+
+    def test_snapshot_records_resolution_conclusion(self):
+        self._submit_all(qty=("1000", "1020", "1000"))
+        did = next(d["id"] for d in core.list_discrepancies(self.conn, self.sid))
+        core.claim_discrepancy(self.conn, did, owner="李")
+        core.add_supplement(self.conn, did, note="已核实为 1020", actor="李")
+        self._submit_all(qty=("1020", "1020", "1020"))
+        core.resolve_discrepancy(self.conn, did, actor="李")
+        core.freeze_package(self.conn, self.sid, actor="李")
+        pkg = core.get_package(self.conn, core.list_packages(self.conn, self.sid)[0]["id"])
+        qty = next(d for d in pkg["discrepancies"] if d["field"] == "quantity")
+        self.assertEqual(qty["status"], "resolved")
+        self.assertEqual(qty["owner"], "李")
+        self.assertIn("1020", qty["supplement_note"])
+        actions = {t["action"] for t in qty["timeline"]}
+        self.assertIn("discrepancy_claimed", actions)
+        self.assertIn("discrepancy_resolved", actions)
+
+    def test_markdown_export_contains_provenance(self):
+        self._submit_all()
+        core.freeze_package(self.conn, self.sid, actor="李")
+        pkg = core.get_package(self.conn, core.list_packages(self.conn, self.sid)[0]["id"])
+        md = core.export_markdown(pkg)
+        self.assertIn("申报核对单 — PK-1", md)
+        self.assertIn("v1", md)
+        self.assertIn("陈", md)
+        self.assertIn("不可变快照", md)
+
+    def test_freeze_logged(self):
+        self._submit_all()
+        core.freeze_package(self.conn, self.sid, actor="李")
+        actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        self.assertIn("package_frozen", actions)
+
+
 class FlaskSmokeTest(unittest.TestCase):
     def setUp(self):
         os.environ["CUSTOMS_DB"] = os.path.join(tempfile.mkdtemp(), "http.db")

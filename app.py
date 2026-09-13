@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import os
 
-from flask import Flask, flash, g, redirect, render_template, request, url_for
+from flask import (Flask, Response, flash, g, redirect, render_template, request,
+                   url_for)
 
 import core
 
@@ -130,6 +131,7 @@ def detail(shipment_id):
         })
     logs = core.list_logs(conn, shipment_id)
     tokens = core.list_tokens(conn, shipment_id)
+    packages = core.list_packages(conn, shipment_id)
     reminder_rows = list(conn.execute(
         """SELECT e.*, n.target, n.status AS nstatus, n.attempts
            FROM reminder_event e JOIN notification n ON n.event_id = e.id
@@ -140,7 +142,8 @@ def detail(shipment_id):
     return render_template(
         "detail.html",
         s=shipment, docs=docs, table=table, cards=cards, logs=logs,
-        tokens=tokens, reminders=reminder_rows, deadline_risk=deadline_risk,
+        tokens=tokens, packages=packages, reminders=reminder_rows,
+        deadline_risk=deadline_risk,
         sources=core.SOURCES, source_labels=core.SOURCE_LABELS,
         field_labels=core.FIELD_LABELS,
         status_labels={"open": "待认领", "claimed": "处理中", "resolved": "已解决"},
@@ -307,6 +310,48 @@ def portal_submit(token):
     if result["duplicate"]:
         return _portal_page(token, error="提交内容与现行版本一致，已按重复提交忽略，未新增资料版本。")
     return _portal_page(token, just_submitted=result["changed_fields"])
+
+
+# ------------------------------------------------------------ 申报包冻结与导出
+
+@app.route("/shipments/<int:shipment_id>/packages", methods=["POST"])
+def freeze_package(shipment_id):
+    confirm = request.form.get("confirm_open") == "1"
+    try:
+        result = core.freeze_package(
+            db(), shipment_id, actor=request.form.get("actor", ""), confirm=confirm)
+        flash(f"申报包 #{result['package_no']} 已冻结（不可变），可导出留档", "ok")
+    except ValueError as e:
+        flash(f"冻结被阻止：{e}", "error")
+    except Exception as e:
+        flash(f"冻结失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
+
+
+@app.route("/packages/<int:package_id>/export.<fmt>")
+def export_package(package_id, fmt):
+    try:
+        package = core.get_package(db(), package_id)
+    except LookupError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    shipment_id = package["shipment"]["id"]
+    ref = package["shipment"]["ref"]
+    no = package["package_no"]
+    if fmt == "json":
+        body = json.dumps(package, ensure_ascii=False, indent=2)
+        return Response(
+            body, mimetype="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{ref}-pkg{no}.json"'})
+    if fmt == "md":
+        body = core.export_markdown(package)
+        return Response(
+            body, content_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{ref}-pkg{no}.md"'})
+    flash("不支持的导出格式", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
 
 
 if __name__ == "__main__":

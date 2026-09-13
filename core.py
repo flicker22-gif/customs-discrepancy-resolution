@@ -159,6 +159,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at  TEXT NOT NULL
 );
 
+-- 申报包：申报前冻结的不可变快照。内容整体存在 payload_json 里，
+-- 冻结后三方再来新版本也不会改动该包（只新增新的包，从不 UPDATE/DELETE）。
+CREATE TABLE IF NOT EXISTS declaration_package (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_id     INTEGER NOT NULL REFERENCES shipment(id),
+    package_no      INTEGER NOT NULL,
+    frozen_by       TEXT NOT NULL DEFAULT '',
+    frozen_at       TEXT NOT NULL,
+    declared_fields TEXT NOT NULL DEFAULT '',
+    open_items      INTEGER NOT NULL DEFAULT 0,
+    payload_json    TEXT NOT NULL,
+    UNIQUE(shipment_id, package_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_document_shipment ON document(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_discrepancy_shipment ON discrepancy(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_notification_status ON notification(status);
@@ -705,3 +719,216 @@ def supplier_submit(conn: sqlite3.Connection, token: str, values: dict,
     conn.commit()
     recompute(conn, tok["shipment_id"], actor=actor)
     return result
+
+
+# ------------------------------------------------------------- 申报包冻结与导出
+
+STATUS_LABELS = {
+    STATUS_OPEN: "待认领",
+    STATUS_CLAIMED: "处理中",
+    STATUS_RESOLVED: "已解决",
+}
+
+
+def build_snapshot(conn: sqlite3.Connection, shipment_id: int) -> dict:
+    """组装一票货当前采用资料 + 差异处理结论的快照（尚未落库，落库后不可变）。"""
+    shipment = dict(get_shipment(conn, shipment_id))
+    docs = {r["source"]: dict(r) for r in list_documents(conn, shipment_id)}
+    discs = list_discrepancies(conn, shipment_id)
+    all_logs = list_logs(conn, shipment_id)
+
+    # 逐字段确定“申报采用值”：三方一致即可采用；仍有分歧则不替业务拍板，留空并列入风险
+    declared_fields = {}
+    warnings = []
+    for field in FIELDS:
+        present = {}
+        for src in SOURCES:
+            doc = docs.get(src)
+            if doc and str(doc.get(field) or "").strip():
+                present[src] = doc[field]
+        norms = {NORMALIZERS[field](v) for v in present.values()}
+        entry = {"field": field, "label": FIELD_LABELS[field],
+                 "values_by_source": present, "all_agree": len(norms) <= 1}
+        if len(present) < len(SOURCES):
+            missing = [SOURCE_LABELS[s] for s in SOURCES if s not in present]
+            entry["missing_sources"] = missing
+            warnings.append(f"【{FIELD_LABELS[field]}】缺少 {'、'.join(missing)} 的资料")
+        if entry["all_agree"] and present:
+            entry["adopted_value"] = next(iter(present.values()))
+            entry["basis_sources"] = list(present.keys())
+        else:
+            entry["adopted_value"] = None
+            if len(norms) >= 2:
+                warnings.append(f"【{FIELD_LABELS[field]}】三方仍不一致，申报包未冻结采用值")
+        declared_fields[field] = entry
+
+    discrepancies_out = []
+    for d in discs:
+        d = dict(d)
+        field = d["field"]
+        d["field_label"] = FIELD_LABELS[field]
+        d["status_label"] = STATUS_LABELS.get(d["status"], d["status"])
+        d["values"] = {src: {"raw": v["raw"], "version": v["version"],
+                             "submitted_at": v.get("submitted_at", "")}
+                       for src, v in json.loads(d["values_json"]).items()}
+        # 该差异的处理轨迹：认领/补件/重开/解决等（按字段标签从全量留痕中筛出）
+        tag = f"【{FIELD_LABELS[field]}】"
+        d["timeline"] = [{"actor": l["actor"], "action": l["action"],
+                          "detail": l["detail"], "created_at": l["created_at"]}
+                         for l in all_logs if tag in l["detail"]]
+        if d["status"] != STATUS_RESOLVED and not d["is_reconciled"]:
+            warnings.append(f"【{FIELD_LABELS[field]}】存在{d['status_label']}的未解决差异，"
+                            f"冻结前请确认是否带差异申报")
+        discrepancies_out.append(d)
+
+    open_items = sum(1 for d in discrepancies_out
+                     if d["status"] != STATUS_RESOLVED and not d["is_reconciled"])
+    return {
+        "generated_at": now(),
+        "shipment": shipment,
+        "documents": {src: {
+            "source": src,
+            "source_label": SOURCE_LABELS[src],
+            "version": docs[src]["version"],
+            "product_name": docs[src]["product_name"],
+            "quantity": docs[src]["quantity"],
+            "carton_no": docs[src]["carton_no"],
+            "submitted_by": docs[src]["submitted_by"],
+            "submitted_at": docs[src]["submitted_at"],
+        } for src in SOURCES if src in docs},
+        "declared_fields": declared_fields,
+        "discrepancies": discrepancies_out,
+        "warnings": warnings,
+        "open_items": open_items,
+    }
+
+
+def freeze_package(conn: sqlite3.Connection, shipment_id: int, actor: str = "",
+                   confirm: bool = False) -> dict:
+    """把当前状态冻结为一个不可变申报包。
+
+    默认拒绝带未解决差异冻结（confirm=True 表示负责人确认“带差异申报”并留痕）。
+    返回 {"package_no", "open_items"}。
+    """
+    get_shipment(conn, shipment_id)
+    snapshot = build_snapshot(conn, shipment_id)
+    if snapshot["open_items"] and not confirm:
+        raise ValueError(f"还有 {snapshot['open_items']} 处未解决差异；"
+                         "确认要带差异冻结时需显式确认（confirm=True）")
+
+    next_no = conn.execute(
+        "SELECT COALESCE(MAX(package_no), 0) + 1 FROM declaration_package WHERE shipment_id = ?",
+        (shipment_id,)).fetchone()[0]
+    snapshot["package_no"] = next_no
+    snapshot["frozen_by"] = (actor or "").strip() or "未知"
+    snapshot["frozen_at"] = now()
+
+    declared_desc = "，".join(
+        f"{e['label']}={'采用「' + e['adopted_value'] + '」' if e['adopted_value'] else '未采用（分歧）'}"
+        for e in snapshot["declared_fields"].values())
+    conn.execute(
+        """INSERT INTO declaration_package
+               (shipment_id, package_no, frozen_by, frozen_at, declared_fields,
+                open_items, payload_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (shipment_id, next_no, snapshot["frozen_by"], snapshot["frozen_at"],
+         declared_desc, snapshot["open_items"],
+         json.dumps(snapshot, ensure_ascii=False, indent=2)),
+    )
+    note = f"冻结申报包 #{next_no}：{declared_desc}"
+    if snapshot["warnings"]:
+        note += f"；风险提示 {len(snapshot['warnings'])} 条"
+    if snapshot["open_items"]:
+        note += f"；负责人确认带 {snapshot['open_items']} 处未解决差异申报"
+    _log(conn, shipment_id, actor, "package_frozen", note)
+    conn.commit()
+    return {"package_no": next_no, "open_items": snapshot["open_items"]}
+
+
+def list_packages(conn: sqlite3.Connection, shipment_id: int) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT id, package_no, frozen_by, frozen_at, declared_fields, open_items "
+        "FROM declaration_package WHERE shipment_id = ? ORDER BY package_no",
+        (shipment_id,)))
+
+
+def get_package(conn: sqlite3.Connection, package_id: int) -> dict:
+    row = conn.execute("SELECT * FROM declaration_package WHERE id = ?",
+                       (package_id,)).fetchone()
+    if row is None:
+        raise LookupError(f"申报包 #{package_id} 不存在")
+    payload = json.loads(row["payload_json"])
+    payload["_id"] = row["id"]
+    return payload
+
+
+def export_markdown(package: dict) -> str:
+    """把申报包渲染成带来源与时间的 Markdown 申报核对单。"""
+    s = package["shipment"]
+    lines = []
+    lines.append(f"# 申报核对单 — {s['ref']}")
+    lines.append("")
+    lines.append(f"- 申报包编号：#{package['package_no']}（不可变快照）")
+    lines.append(f"- 冻结时间：{package['frozen_at']}")
+    lines.append(f"- 冻结操作人：{package['frozen_by']}")
+    lines.append(f"- 客户：{s.get('customer') or '—'}　货描：{s.get('description') or '—'}")
+    if s.get("deadline"):
+        lines.append(f"- 报关截止：{s['deadline']}")
+    lines.append("")
+
+    lines.append("## 一、申报采用值")
+    lines.append("")
+    lines.append("| 字段 | 申报采用值 | 依据来源 | 供应商 | 货代 | 仓库 |")
+    lines.append("|---|---|---|---|---|---|")
+    for field in FIELDS:
+        e = package["declared_fields"][field]
+        by = e["values_by_source"]
+        basis = "、".join(SOURCE_LABELS[x] for x in e.get("basis_sources", [])) or "—（三方分歧，未采用）"
+        adopted = e["adopted_value"] or "**未冻结（仍有分歧）**"
+        cells = []
+        for src in SOURCES:
+            doc = package["documents"].get(src)
+            cells.append(f"{doc[field]}（v{doc['version']}，{doc['submitted_by'] or '无名'}，{doc['submitted_at']}）"
+                         if doc and doc.get(field) else "未提交")
+        lines.append(f"| {FIELD_LABELS[field]} | {adopted} | {basis} | {cells[0]} | {cells[1]} | {cells[2]} |")
+    lines.append("")
+
+    lines.append("## 二、差异处理结论")
+    lines.append("")
+    if not package["discrepancies"]:
+        lines.append("本票货未产生任何字段差异。")
+    for d in package["discrepancies"]:
+        state = d["status_label"]
+        if d["status"] != STATUS_RESOLVED and d["is_reconciled"]:
+            state = "核对一致，待确认"
+        lines.append(f"### 【{d['field_label']}】— {state}（风险轮次 第{d['episode']}轮）")
+        lines.append("")
+        lines.append("| 来源 | 冻结时的值 | 资料版本 | 提交时间 |")
+        lines.append("|---|---|---|---|")
+        for src in SOURCES:
+            v = d["values"].get(src)
+            if v:
+                lines.append(f"| {SOURCE_LABELS[src]} | {v['raw']} | v{v['version']} | {v.get('submitted_at') or ''} |")
+            else:
+                lines.append(f"| {SOURCE_LABELS[src]} | 未提交 | — | — |")
+        lines.append("")
+        lines.append(f"- 负责人：{d['owner'] or '未认领'}")
+        if d["supplement_note"]:
+            lines.append("- 补件记录：")
+            for n in d["supplement_note"].splitlines():
+                lines.append(f"  - {n}")
+        if d["timeline"]:
+            lines.append("- 处理留痕：")
+            for t in d["timeline"]:
+                lines.append(f"  - {t['created_at']} {t['actor']}：{t['detail']}")
+        lines.append("")
+
+    if package["warnings"]:
+        lines.append("## 三、冻结时风险提示")
+        lines.append("")
+        for w in package["warnings"]:
+            lines.append(f"- ⚠️ {w}")
+        lines.append("")
+    lines.append("---")
+    lines.append("本文件由冻结时刻的数据库快照生成，后续资料版本更新不影响本申报包内容。")
+    return "\n".join(lines)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 
 from flask import (Flask, Response, flash, g, redirect, render_template, request,
                    url_for)
@@ -165,7 +166,9 @@ def detail(shipment_id):
         })
     logs = core.list_logs(conn, shipment_id)
     tokens = core.list_tokens(conn, shipment_id)
-    packages = core.list_packages(conn, shipment_id)
+    packages = _package_view_models(conn, shipment_id)
+    # 本次页面渲染内冻结表单的防重键：同一页面重复提交只冻出一个包
+    freeze_idem = secrets.token_urlsafe(12)
     rules = core.list_rules(conn, shipment_id)
     rule_current = {}
     rule_history = {}
@@ -183,13 +186,35 @@ def detail(shipment_id):
     return render_template(
         "detail.html",
         s=shipment, docs=docs, table=table, cards=cards, logs=logs,
-        tokens=tokens, packages=packages, reminders=reminder_rows,
+        tokens=tokens, packages=packages, freeze_idem=freeze_idem, reminders=reminder_rows,
         deadline_risk=deadline_risk,
         rules=rules, rule_current=rule_current, rule_history=rule_history,
         sources=core.SOURCES, source_labels=core.SOURCE_LABELS,
         field_labels=core.FIELD_LABELS,
+        pkg_status=core.PACKAGE_STATUS_LABELS,
+        pkg_constants={"pending": core.PACKAGE_PENDING, "approved": core.PACKAGE_APPROVED,
+                       "released": core.PACKAGE_RELEASED, "rejected": core.PACKAGE_REJECTED,
+                       "review_customs": core.REVIEW_CUSTOMS,
+                       "review_supervisor": core.REVIEW_SUPERVISOR},
+        review_role_labels=core.REVIEW_ROLE_LABELS,
         status_labels={"open": "待认领", "claimed": "处理中", "resolved": "已解决"},
     )
+
+
+def _package_view_models(conn, shipment_id):
+    """列表行 + 活的会签/放行状态（payload 不动），供详情页渲染状态机。"""
+    out = []
+    for p in core.list_packages(conn, shipment_id):
+        reviews = core.list_package_reviews(conn, p["id"])
+        out.append({
+            "row": p,
+            "reviews": reviews,
+            "review_by_role": {r["role"]: r for r in reviews},
+            "rejection": next((r for r in reviews if r["decision"] == core.REVIEW_REJECT), None),
+            "status_label": core.PACKAGE_STATUS_LABELS.get(p["status"], p["status"]),
+            "is_internal": p["status"] != core.PACKAGE_RELEASED,
+        })
+    return out
 
 
 def _deadline_risk(shipment, cards):
@@ -449,13 +474,75 @@ def freeze_package(shipment_id):
     confirm = request.form.get("confirm_open") == "1"
     try:
         result = core.freeze_package(
-            db(), shipment_id, actor=request.form.get("actor", ""), confirm=confirm)
-        flash(f"申报包 #{result['package_no']} 已冻结（不可变），可导出留档", "ok")
+            db(), shipment_id, actor=request.form.get("actor", ""), confirm=confirm,
+            designated_operator=request.form.get("designated_operator", ""),
+            idempotency_key=request.form.get("idem_key") or None)
     except ValueError as e:
         flash(f"冻结被阻止：{e}", "error")
-    except Exception as e:
+        return redirect(url_for("detail", shipment_id=shipment_id))
+    except core.PackageStateError as e:
+        flash(str(e), "error")
+        return redirect(url_for("detail", shipment_id=shipment_id))
+    except Exception as e:  # noqa: BLE001 — 数据库锁等异常也要回到详情页而非 500
         flash(f"冻结失败：{e}", "error")
+        return redirect(url_for("detail", shipment_id=shipment_id))
+    if result.get("deduped"):
+        flash(f"冻结请求重复，已忽略（申报包 #{result['package_no']} 仍只有一个）", "ok")
+    else:
+        flash(f"申报包 #{result['package_no']} 已冻结（不可变），进入待复核；"
+              "须由关务复核人与主管（两人不同）会签通过后，指定操作人放行方可申报", "ok")
     return redirect(url_for("detail", shipment_id=shipment_id))
+
+
+@app.route("/packages/<int:package_id>/reviews", methods=["POST"])
+def review_package(package_id):
+    conn = db()
+    try:
+        row = conn.execute("SELECT shipment_id FROM declaration_package WHERE id = ?",
+                           (package_id,)).fetchone()
+        sid = row["shipment_id"] if row else None
+        result = core.review_package(
+            conn, package_id,
+            role=request.form.get("role", ""),
+            actor=request.form.get("actor", ""),
+            decision=request.form.get("decision", ""),
+            comment=request.form.get("comment", ""))
+    except LookupError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    except (ValueError, core.PackageStateError) as e:
+        flash(f"会签失败：{e}", "error")
+        return redirect(url_for("detail", shipment_id=sid))
+    if result.get("duplicate"):
+        flash("该角色已提交过相同意见，按重复提交忽略", "ok")
+    elif result["rejected"]:
+        flash("已驳回并记录原因：该包作废，不能放行；请重新处理后冻结新包", "error")
+    elif result["status"] == core.PACKAGE_APPROVED:
+        flash("两方会签均已通过，可由指定操作人放行", "ok")
+    else:
+        flash("复核意见已记录，等待另一角色会签", "ok")
+    return redirect(url_for("detail", shipment_id=sid))
+
+
+@app.route("/packages/<int:package_id>/release", methods=["POST"])
+def release_package(package_id):
+    conn = db()
+    try:
+        row = conn.execute("SELECT shipment_id FROM declaration_package WHERE id = ?",
+                           (package_id,)).fetchone()
+        sid = row["shipment_id"] if row else None
+        result = core.release_package(conn, package_id, actor=request.form.get("actor", ""))
+    except LookupError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    except (ValueError, core.PackageStateError) as e:
+        flash(f"放行失败：{e}", "error")
+        return redirect(url_for("detail", shipment_id=sid))
+    if result.get("duplicate"):
+        flash("该包已放行，重复点击已忽略", "ok")
+    else:
+        flash("申报包已放行：下载件即为正式申报依据（未放行旧下载件仍带内部水印）", "ok")
+    return redirect(url_for("detail", shipment_id=sid))
 
 
 @app.route("/packages/<int:package_id>/export.<fmt>")
@@ -468,18 +555,21 @@ def export_package(package_id, fmt):
     shipment_id = package["shipment"]["id"]
     ref = package["shipment"]["ref"]
     no = package["package_no"]
+    wf = package.get("workflow") or {}
+    # 文件名也区分：内部复核稿 vs 已放行正式包，避免内部稿被误当申报件
+    suffix = "" if wf.get("status") == core.PACKAGE_RELEASED else "-内部复核稿"
     if fmt == "json":
         body = json.dumps(package, ensure_ascii=False, indent=2)
         return Response(
             body, mimetype="application/json",
             headers={"Content-Disposition":
-                     f'attachment; filename="{ref}-pkg{no}.json"'})
+                     f'attachment; filename="{ref}-pkg{no}{suffix}.json"'})
     if fmt == "md":
         body = core.export_markdown(package)
         return Response(
             body, content_type="text/markdown; charset=utf-8",
             headers={"Content-Disposition":
-                     f'attachment; filename="{ref}-pkg{no}.md"'})
+                     f'attachment; filename="{ref}-pkg{no}{suffix}.md"'})
     flash("不支持的导出格式", "error")
     return redirect(url_for("detail", shipment_id=shipment_id))
 

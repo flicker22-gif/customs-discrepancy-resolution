@@ -58,6 +58,31 @@ WAIVER_STATUS_LABELS = {
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "customs.db")
 
+# 申报包会签/放行状态机：
+#   pending_review 冻结完成，等待关务复核人 + 关务主管会签（两人、不同人、各留意见与时间）
+#   approved       两人均通过；等待指定操作人放行
+#   released       指定操作人放行，可作为正式申报依据导出
+#   rejected       任一会签人驳回（必须写原因），终态：不能放行、不能改、不能复用旧审批；
+#                  业务重新处理后只能冻结一个新包，新包重新走完整会签
+PACKAGE_PENDING = "pending_review"
+PACKAGE_APPROVED = "approved"
+PACKAGE_RELEASED = "released"
+PACKAGE_REJECTED = "rejected"
+PACKAGE_STATUS_LABELS = {
+    PACKAGE_PENDING: "待复核（仅供内部复核，不得申报）",
+    PACKAGE_APPROVED: "会签通过，待放行（仅供内部复核，不得申报）",
+    PACKAGE_RELEASED: "已放行（正式申报包）",
+    PACKAGE_REJECTED: "已驳回（作废，需重新处理后冻结新包）",
+}
+# 会签角色：两人必须不同
+REVIEW_CUSTOMS = "customs_reviewer"   # 关务复核人
+REVIEW_SUPERVISOR = "supervisor"      # 关务主管
+REVIEW_ROLE_LABELS = {REVIEW_CUSTOMS: "关务复核人", REVIEW_SUPERVISOR: "关务主管"}
+REVIEW_APPROVE = "approve"
+REVIEW_REJECT = "reject"
+# 未放行包导出件的统一水印
+INTERNAL_REVIEW_WATERMARK = "【仅供内部复核 · 非正式申报依据】"
+
 
 # ---------------------------------------------------------------- 归一化比对
 
@@ -309,7 +334,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- 申报包：申报前冻结的不可变快照。内容整体存在 payload_json 里，
--- 冻结后三方再来新版本也不会改动该包（只新增新的包，从不 UPDATE/DELETE）。
+-- 冻结后三方再来新版本也不会改动该包（只新增新的包，从不 UPDATE/DELETE payload）。
+-- 会签/放行是活数据状态机，写在 payload_json 之外：
+-- payload 永不修改，审批/放行只能推进包的状态、不能挪动或改写旧包内容。
 CREATE TABLE IF NOT EXISTS declaration_package (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     shipment_id     INTEGER NOT NULL REFERENCES shipment(id),
@@ -319,7 +346,24 @@ CREATE TABLE IF NOT EXISTS declaration_package (
     declared_fields TEXT NOT NULL DEFAULT '',
     open_items      INTEGER NOT NULL DEFAULT 0,
     payload_json    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending_review',
+    designated_operator TEXT NOT NULL DEFAULT '',   -- 指定的放行操作人（空=不限定）
+    released_by     TEXT NOT NULL DEFAULT '',
+    released_at     TEXT,
+    idempotency_key TEXT,                            -- 冻结防重键（同键只产一个包）
     UNIQUE(shipment_id, package_no)
+);
+
+-- 会签意见：一个包每个角色最多一条生效意见；approve×2（且两人不同）→ approved；任一 reject → rejected
+CREATE TABLE IF NOT EXISTS package_review (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id  INTEGER NOT NULL REFERENCES declaration_package(id),
+    role        TEXT NOT NULL,            -- customs_reviewer / supervisor
+    actor       TEXT NOT NULL,
+    decision    TEXT NOT NULL,            -- approve / reject
+    comment     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    UNIQUE(package_id, role)
 );
 
 -- 容差规则：一票货一个字段一条“版本链”，append-only。
@@ -379,13 +423,20 @@ _MIGRATIONS = {
         ("close_reason", "TEXT"),
         ("active_waiver_id", "INTEGER"),
     ],
+    "declaration_package": [
+        ("status", "TEXT NOT NULL DEFAULT 'pending_review'"),
+        ("designated_operator", "TEXT NOT NULL DEFAULT ''"),
+        ("released_by", "TEXT NOT NULL DEFAULT ''"),
+        ("released_at", "TEXT"),
+        ("idempotency_key", "TEXT"),
+    ],
 }
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or DEFAULT_DB
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -394,15 +445,38 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _migrate(conn)
+    # 依赖迁移补列之后才能建的索引：冻结防重（NULL 互不冲突，旧包不受约束）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_package_idempotency "
+        "ON declaration_package(idempotency_key) WHERE idempotency_key IS NOT NULL")
     conn.commit()
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
+    legacy_packages = False
     for table, cols in _MIGRATIONS.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, ddl in cols:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                # status 列本次才补上 = 会签功能上线前的旧库：既有冻结包全部需要归档
+                if table == "declaration_package" and name == "status":
+                    legacy_packages = True
+    if legacy_packages:
+        _backfill_legacy_packages(conn)
+
+
+def _backfill_legacy_packages(conn: sqlite3.Connection) -> None:
+    """会签功能上线前冻结的旧包：视为放行前历史归档为 released 并补审计，
+    保证现有冻结包与导出入口不失效，同时在留痕里标明是迁移放行而非操作人放行。"""
+    legacy = list(conn.execute("SELECT * FROM declaration_package"))
+    for p in legacy:
+        conn.execute("UPDATE declaration_package SET status = ?, released_by = ?, released_at = ? "
+                     "WHERE id = ?",
+                     (PACKAGE_RELEASED, "系统迁移", p["frozen_at"], p["id"]))
+        _log(conn, p["shipment_id"], "系统迁移", "package_legacy_released",
+             f"申报包 #{p['package_no']} 为会签功能上线前冻结的历史包，迁移归档为已放行"
+             "（不可变快照，导出入口保留）")
 
 
 def now() -> str:
@@ -1398,80 +1472,384 @@ def build_snapshot(conn: sqlite3.Connection, shipment_id: int) -> dict:
     }
 
 
-def freeze_package(conn: sqlite3.Connection, shipment_id: int, actor: str = "",
-                   confirm: bool = False) -> dict:
-    """把当前状态冻结为一个不可变申报包。
-
-    默认拒绝带未解决差异冻结（confirm=True 表示负责人确认“带差异申报”并留痕）。
-    返回 {"package_no", "open_items"}。
-    """
-    get_shipment(conn, shipment_id)
-    snapshot = build_snapshot(conn, shipment_id)
-    if snapshot["open_items"] and not confirm:
-        raise ValueError(f"还有 {snapshot['open_items']} 处未解决差异；"
-                         "确认要带差异冻结时需显式确认（confirm=True）")
-
-    next_no = conn.execute(
-        "SELECT COALESCE(MAX(package_no), 0) + 1 FROM declaration_package WHERE shipment_id = ?",
-        (shipment_id,)).fetchone()[0]
-    snapshot["package_no"] = next_no
-    snapshot["frozen_by"] = (actor or "").strip() or "未知"
-    snapshot["frozen_at"] = now()
-
-    declared_desc = "，".join(
-        f"{e['label']}={'采用「' + e['adopted_value'] + '」' if e['adopted_value'] else '未采用（分歧）'}"
-        for e in snapshot["declared_fields"].values())
-    conn.execute(
-        """INSERT INTO declaration_package
-               (shipment_id, package_no, frozen_by, frozen_at, declared_fields,
-                open_items, payload_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (shipment_id, next_no, snapshot["frozen_by"], snapshot["frozen_at"],
-         declared_desc, snapshot["open_items"],
-         json.dumps(snapshot, ensure_ascii=False, indent=2)),
-    )
-    note = f"冻结申报包 #{next_no}：{declared_desc}"
-    if snapshot["waived_items"]:
-        note += f"；{snapshot['waived_items']} 处差异在限时豁免期内（豁免证据随包固化）"
-    if snapshot["warnings"]:
-        note += f"；风险提示 {len(snapshot['warnings'])} 条"
-    if snapshot["open_items"]:
-        note += f"；负责人确认带 {snapshot['open_items']} 处未解决差异申报"
-    _log(conn, shipment_id, actor, "package_frozen", note)
-    conn.commit()
-    return {"package_no": next_no, "open_items": snapshot["open_items"]}
+class PackageStateError(Exception):
+    """申报包状态机非法操作（状态不对/角色越权/同人双角色/重复提交等）。"""
 
 
-def list_packages(conn: sqlite3.Connection, shipment_id: int) -> list[sqlite3.Row]:
-    return list(conn.execute(
-        "SELECT id, package_no, frozen_by, frozen_at, declared_fields, open_items "
-        "FROM declaration_package WHERE shipment_id = ? ORDER BY package_no",
-        (shipment_id,)))
+def _immediate_tx(conn):
+    """开启写事务并立即拿库级写锁：把“检查—写入”变成临界区，挡住并发审批/放行/冻结。
+    SQLite 默认惰性 BEGIN 在第一条写语句才加锁，显式 BEGIN IMMEDIATE 后
+    第二个并发请求会阻塞至 busy_timeout，随后看到前一个请求的提交结果。"""
+    conn.execute("BEGIN IMMEDIATE")
 
 
-def get_package(conn: sqlite3.Connection, package_id: int) -> dict:
+def _get_package_row(conn: sqlite3.Connection, package_id: int) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM declaration_package WHERE id = ?",
                        (package_id,)).fetchone()
     if row is None:
         raise LookupError(f"申报包 #{package_id} 不存在")
+    return row
+
+
+def freeze_package(conn: sqlite3.Connection, shipment_id: int, actor: str = "",
+                   confirm: bool = False, designated_operator: str = "",
+                   idempotency_key: str | None = None) -> dict:
+    """把当前状态冻结为一个不可变申报包，冻结后进入【待复核】状态。
+
+    - 默认拒绝带未解决差异冻结（confirm=True 表示负责人确认“带差异申报”并留痕）；
+    - designated_operator 指定唯一放行操作人（空字符串=不限定，后续任何登录操作人可放行）；
+    - idempotency_key 非空时，同键重复提交只返回已冻结的包（防重复点击/表单重放）；
+    - 并发冻结同一票货由 (shipment_id, package_no) 唯一约束 + 写锁兜底；
+    - 驳回/待复核中的旧包不阻止冻结新包；新包编号继续递增、审批从零开始，
+      旧包内容与旧审批永远不会被挪动或修改。
+    返回 {"id", "package_no", "open_items", "status", "deduped"}。
+    """
+    get_shipment(conn, shipment_id)
+    actor = (actor or "").strip()
+    designated_operator = (designated_operator or "").strip()
+    idem = idempotency_key.strip() if idempotency_key else None
+
+    # 防重键先在事务外查一次（命中即直接返回，避免无谓写锁）
+    if idem:
+        existing = conn.execute(
+            "SELECT * FROM declaration_package WHERE idempotency_key = ?", (idem,)).fetchone()
+        if existing:
+            return {"id": existing["id"], "package_no": existing["package_no"],
+                    "open_items": existing["open_items"], "status": existing["status"],
+                    "deduped": True}
+
+    try:
+        _immediate_tx(conn)
+        if idem:
+            existing = conn.execute(
+                "SELECT * FROM declaration_package WHERE idempotency_key = ?", (idem,)).fetchone()
+            if existing:
+                conn.commit()
+                return {"id": existing["id"], "package_no": existing["package_no"],
+                        "open_items": existing["open_items"], "status": existing["status"],
+                        "deduped": True}
+        snapshot = build_snapshot(conn, shipment_id)
+        if snapshot["open_items"] and not confirm:
+            conn.rollback()
+            raise ValueError(f"还有 {snapshot['open_items']} 处未解决差异；"
+                             "确认要带差异冻结时需显式确认（confirm=True）")
+
+        next_no = conn.execute(
+            "SELECT COALESCE(MAX(package_no), 0) + 1 FROM declaration_package WHERE shipment_id = ?",
+            (shipment_id,)).fetchone()[0]
+        snapshot["package_no"] = next_no
+        snapshot["frozen_by"] = actor or "未知"
+        snapshot["frozen_at"] = now()
+        snapshot["designated_operator"] = designated_operator
+        snapshot["workflow"] = {
+            "status": PACKAGE_PENDING,
+            "status_label": PACKAGE_STATUS_LABELS[PACKAGE_PENDING],
+            "designated_operator": designated_operator,
+            "reviews": [],
+            "released_by": "",
+            "released_at": None,
+        }
+
+        declared_desc = "，".join(
+            f"{e['label']}={'采用「' + e['adopted_value'] + '」' if e['adopted_value'] else '未采用（分歧）'}"
+            for e in snapshot["declared_fields"].values())
+        try:
+            cur = conn.execute(
+                """INSERT INTO declaration_package
+                       (shipment_id, package_no, frozen_by, frozen_at, declared_fields,
+                        open_items, payload_json, status, designated_operator, idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (shipment_id, next_no, snapshot["frozen_by"], snapshot["frozen_at"],
+                 declared_desc, snapshot["open_items"],
+                 json.dumps(snapshot, ensure_ascii=False, indent=2),
+                 PACKAGE_PENDING, designated_operator, idem),
+            )
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            if idem:
+                existing = conn.execute(
+                    "SELECT * FROM declaration_package WHERE idempotency_key = ?",
+                    (idem,)).fetchone()
+                if existing:
+                    return {"id": existing["id"], "package_no": existing["package_no"],
+                            "open_items": existing["open_items"], "status": existing["status"],
+                            "deduped": True}
+            raise PackageStateError(f"申报包冻结冲突（可能有重复提交），请刷新后重试：{e}")
+        note = f"冻结申报包 #{next_no}（待复核）：{declared_desc}"
+        if designated_operator:
+            note += f"；指定放行操作人：{designated_operator}"
+        if snapshot["waived_items"]:
+            note += f"；{snapshot['waived_items']} 处差异在限时豁免期内（豁免证据随包固化）"
+        if snapshot["warnings"]:
+            note += f"；风险提示 {len(snapshot['warnings'])} 条"
+        if snapshot["open_items"]:
+            note += f"；负责人确认带 {snapshot['open_items']} 处未解决差异申报"
+        _log(conn, shipment_id, actor, "package_frozen", note)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"id": cur.lastrowid, "package_no": next_no,
+            "open_items": snapshot["open_items"], "status": PACKAGE_PENDING, "deduped": False}
+
+
+def list_packages(conn: sqlite3.Connection, shipment_id: int) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT id, package_no, frozen_by, frozen_at, declared_fields, open_items, "
+        "status, designated_operator, released_by, released_at "
+        "FROM declaration_package WHERE shipment_id = ? ORDER BY package_no",
+        (shipment_id,)))
+
+
+def list_package_reviews(conn: sqlite3.Connection, package_id: int) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM package_review WHERE package_id = ? ORDER BY id", (package_id,)))
+
+
+def review_package(conn: sqlite3.Connection, package_id: int, role: str, actor: str,
+                   decision: str, comment: str = "") -> dict:
+    """会签一个待复核包：关务复核人、关务主管各一条意见，两人必须不同。
+
+    - 只能在 pending_review 状态会签；角色只能是 customs_reviewer / supervisor；
+    - 同一角色重复点击：若决策/意见/人完全一致按幂等处理，否则拒绝（后来者看到的是既成结果）；
+    - 两个角色不能是同一人（后一个角色提交时与已存在的另一角色比对，挡住兼任）；
+    - 驳回必须填写原因；任一角色驳回 → rejected 终态，阻止放行；
+    - 两人均通过 → approved。全部变化（含被拦截的非法尝试）写审计。
+    返回 {"status", "rejected": bool}。
+    """
+    actor = (actor or "").strip()
+    comment = (comment or "").strip()
+    if not actor:
+        raise ValueError("会签必须填写操作人姓名")
+    if role not in REVIEW_ROLE_LABELS:
+        raise ValueError(f"会签角色必须是 {REVIEW_CUSTOMS}/{REVIEW_SUPERVISOR}")
+    if decision not in (REVIEW_APPROVE, REVIEW_REJECT):
+        raise ValueError("会签决策必须是 approve / reject")
+    if decision == REVIEW_REJECT and not comment:
+        raise ValueError("驳回必须填写原因")
+
+    try:
+        _immediate_tx(conn)
+        row = _get_package_row(conn, package_id)
+        shipment_id = row["shipment_id"]
+        if row["status"] != PACKAGE_PENDING:
+            conn.rollback()
+            raise PackageStateError(
+                f"申报包 #{row['package_no']} 当前状态为"
+                f"“{PACKAGE_STATUS_LABELS.get(row['status'], row['status'])}”，不能再会签")
+        existing = {r["role"]: r for r in list_package_reviews(conn, package_id)}
+
+        mine = existing.get(role)
+        if mine is not None:
+            # 同一角色重复提交：完全一致 → 幂等成功；不一致 → 拒绝（并发/重复点击的明确行为）
+            if (mine["actor"] == actor and mine["decision"] == decision
+                    and mine["comment"] == comment):
+                conn.rollback()
+                return {"status": row["status"], "rejected": decision == REVIEW_REJECT,
+                        "duplicate": True}
+            conn.rollback()
+            raise PackageStateError(
+                f"{REVIEW_ROLE_LABELS[role]}已由 {mine['actor']} 于 {mine['created_at']}"
+                f"{'通过' if mine['decision'] == REVIEW_APPROVE else '驳回'}，"
+                "同一角色不能重复会签；请刷新查看最新结果")
+
+        other = next((r for r_role, r in existing.items() if r_role != role), None)
+        if other is not None and other["actor"] == actor:
+            _log(conn, shipment_id, actor, "package_review_denied",
+                 f"申报包 #{row['package_no']}：{actor} 已以{REVIEW_ROLE_LABELS[other['role']]}"
+                 f"身份{'通过' if other['decision'] == REVIEW_APPROVE else '驳回'}，"
+                 f"不得再兼任{REVIEW_ROLE_LABELS[role]}，已拒绝")
+            conn.commit()
+            raise PackageStateError(
+                f"关务复核人与主管必须是不同人员：{actor} 已担任{REVIEW_ROLE_LABELS[other['role']]}，"
+                f"不能再担任{REVIEW_ROLE_LABELS[role]}")
+
+        ts = now()
+        conn.execute(
+            "INSERT INTO package_review (package_id, role, actor, decision, comment, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (package_id, role, actor, decision, comment, ts))
+
+        new_status = PACKAGE_PENDING
+        if decision == REVIEW_REJECT:
+            new_status = PACKAGE_REJECTED
+            conn.execute("UPDATE declaration_package SET status = ? WHERE id = ?",
+                         (new_status, package_id))
+            _log(conn, shipment_id, actor, "package_review_rejected",
+                 f"申报包 #{row['package_no']} 被{REVIEW_ROLE_LABELS[role]} {actor} 驳回，"
+                 f"放行已阻止；驳回原因：{comment}。业务重新处理后只能冻结新包，"
+                 "旧包内容与本审批记录不可修改、不可复用")
+        else:
+            _log(conn, shipment_id, actor, "package_review_approved",
+                 f"申报包 #{row['package_no']} {REVIEW_ROLE_LABELS[role]} {actor} 复核通过"
+                 + (f"，意见：{comment}" if comment else ""))
+            # 另一角色也已通过 → 会签完成
+            if other is not None and other["decision"] == REVIEW_APPROVE:
+                new_status = PACKAGE_APPROVED
+                conn.execute("UPDATE declaration_package SET status = ? WHERE id = ?",
+                             (new_status, package_id))
+                _log(conn, shipment_id, actor, "package_countersigned",
+                     f"申报包 #{row['package_no']} 会签通过"
+                     f"（{other['actor']}/{REVIEW_ROLE_LABELS[other['role']]}、"
+                     f"{actor}/{REVIEW_ROLE_LABELS[role]}），等待"
+                     f"{('指定操作人 ' + row['designated_operator']) if row['designated_operator'] else '操作人'}"
+                     "放行")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"status": new_status, "rejected": new_status == PACKAGE_REJECTED}
+
+
+def release_package(conn: sqlite3.Connection, package_id: int, actor: str) -> dict:
+    """由指定操作人把会签通过的包执行放行。
+
+    - 只有 approved 可放行：待复核/已驳回一律拒绝（驳回即终态，不能“补签放行”）；
+    - 冻结时指定了放行操作人的，必须本人放行；未指定则任何非空操作人可放行；
+    - 并发重复放行由写锁 + 状态复查挡住，只有第一次生效；
+    - 放行后不可撤回；放行时间/人写入审计。返回 {"status": "released", "duplicate": bool}。
+    """
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("放行必须填写操作人姓名")
+    try:
+        _immediate_tx(conn)
+        row = _get_package_row(conn, package_id)
+        if row["status"] == PACKAGE_RELEASED:
+            conn.rollback()
+            if row["released_by"] == actor:
+                return {"status": PACKAGE_RELEASED, "duplicate": True}
+            raise PackageStateError(
+                f"申报包 #{row['package_no']} 已由 {row['released_by']} 于 "
+                f"{row['released_at']} 放行，不能重复放行")
+        if row["status"] == PACKAGE_REJECTED:
+            conn.rollback()
+            raise PackageStateError(
+                f"申报包 #{row['package_no']} 已被驳回，不能放行；"
+                "请按驳回原因重新处理后冻结新包")
+        if row["status"] != PACKAGE_APPROVED:
+            conn.rollback()
+            raise PackageStateError(
+                f"申报包 #{row['package_no']} 尚在待复核，关务复核人与主管会签通过前不能放行")
+        designated = row["designated_operator"]
+        if designated and designated != actor:
+            _log(conn, row["shipment_id"], actor, "package_release_denied",
+                 f"申报包 #{row['package_no']} 指定放行操作人为 {designated}，"
+                 f"{actor} 尝试放行被拒绝")
+            conn.commit()
+            raise PackageStateError(
+                f"该申报包指定的放行操作人是 {designated}，{actor} 无权放行")
+        ts = now()
+        conn.execute(
+            "UPDATE declaration_package SET status = ?, released_by = ?, released_at = ? WHERE id = ?",
+            (PACKAGE_RELEASED, actor, ts, package_id))
+        _log(conn, row["shipment_id"], actor, "package_released",
+             f"申报包 #{row['package_no']} 由 {actor} 放行，成为正式申报依据；"
+             "未放行包仅为内部复核稿")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"status": PACKAGE_RELEASED, "duplicate": False}
+
+
+def get_package(conn: sqlite3.Connection, package_id: int) -> dict:
+    """取包内容：payload_json 永不回改，活数据的会签/放行状态从外部表合并进去。"""
+    row = _get_package_row(conn, package_id)
     payload = json.loads(row["payload_json"])
     payload["_id"] = row["id"]
+    reviews = []
+    for r in list_package_reviews(conn, package_id):
+        reviews.append({
+            "role": r["role"], "role_label": REVIEW_ROLE_LABELS.get(r["role"], r["role"]),
+            "actor": r["actor"], "decision": r["decision"],
+            "decision_label": "通过" if r["decision"] == REVIEW_APPROVE else "驳回",
+            "comment": r["comment"], "created_at": r["created_at"],
+        })
+    workflow = {
+        "status": row["status"],
+        "status_label": PACKAGE_STATUS_LABELS.get(row["status"], row["status"]),
+        "designated_operator": row["designated_operator"],
+        "released_by": row["released_by"],
+        "released_at": row["released_at"],
+        "reviews": reviews,
+        "rejection_reason": next((r["comment"] for r in reviews
+                                  if r["decision"] == REVIEW_REJECT), None),
+    }
+    workflow["is_internal"] = row["status"] != PACKAGE_RELEASED
+    payload["workflow"] = workflow
+    # JSON 导出也能一眼区分内部复核稿与正式放行包
+    payload["_document_class"] = ("released_declaration"
+                                  if row["status"] == PACKAGE_RELEASED
+                                  else "internal_review_only")
+    payload["_document_class_label"] = (
+        "正式申报包（已放行）" if row["status"] == PACKAGE_RELEASED else INTERNAL_REVIEW_WATERMARK)
     return payload
 
 
 def export_markdown(package: dict) -> str:
-    """把申报包渲染成带来源与时间的 Markdown 申报核对单。"""
+    """把申报包渲染成带来源与时间的 Markdown 申报核对单。
+
+    头部和结尾醒目标注文件性质：未放行包（待复核/会签通过待放行/已驳回）每页都带
+    “仅供内部复核·非正式申报依据”水印；已放行包标注正式放行信息。
+    """
     s = package["shipment"]
+    wf = package.get("workflow") or {}
+    status = wf.get("status", PACKAGE_RELEASED)
+    is_released = status == PACKAGE_RELEASED
+    banner = ("✅ 正式申报包（已放行）" if is_released
+              else ("⛔ 已驳回 · 作废包（仅供内部复核，禁止申报）"
+                    if status == PACKAGE_REJECTED
+                    else f"⛔ {INTERNAL_REVIEW_WATERMARK}（{wf.get('status_label') or ''}）"))
     lines = []
+    lines.append(banner)
+    lines.append("")
     lines.append(f"# 申报核对单 — {s['ref']}")
     lines.append("")
     lines.append(f"- 申报包编号：#{package['package_no']}（不可变快照）")
+    lines.append(f"- 包状态：**{wf.get('status_label') or PACKAGE_STATUS_LABELS[status]}**")
     lines.append(f"- 冻结时间：{package['frozen_at']}")
     lines.append(f"- 冻结操作人：{package['frozen_by']}")
+    if is_released:
+        lines.append(f"- 放行操作人：{wf.get('released_by') or '—'}　放行时间：{wf.get('released_at') or '—'}")
+    elif wf.get("designated_operator"):
+        lines.append(f"- 指定放行操作人：{wf['designated_operator']}（会签通过后仅其本人可放行）")
     lines.append(f"- 客户：{s.get('customer') or '—'}　货描：{s.get('description') or '—'}")
     if s.get("deadline"):
         lines.append(f"- 报关截止：{s['deadline']}")
     lines.append("")
+
+    # 会签记录：两人、不同人、各自意见与时间；驳回原因单列
+    reviews = wf.get("reviews") or []
+    if reviews or not is_released:
+        lines.append("## 〇、会签与放行记录")
+        lines.append("")
+        if reviews:
+            lines.append("| 角色 | 操作人 | 结论 | 意见/驳回原因 | 时间 |")
+            lines.append("|---|---|---|---|---|")
+            for r in reviews:
+                lines.append(f"| {r['role_label']} | {r['actor']} | {r['decision_label']} "
+                             f"| {r['comment'] or '—'} | {r['created_at']} |")
+            lines.append("")
+        if status == PACKAGE_PENDING:
+            done = {r["role"] for r in reviews}
+            waiting = [REVIEW_ROLE_LABELS[r] for r in (REVIEW_CUSTOMS, REVIEW_SUPERVISOR)
+                       if r not in done]
+            if waiting:
+                lines.append(f"> ⛔ {INTERNAL_REVIEW_WATERMARK} 尚待：{'、'.join(waiting)}会签"
+                             "（两人必须不同）。")
+                lines.append("")
+        elif status == PACKAGE_APPROVED:
+            who = f"指定操作人 {wf['designated_operator']}" if wf.get("designated_operator") else "操作人"
+            lines.append(f"> ⛔ {INTERNAL_REVIEW_WATERMARK} 会签已通过，尚待 {who} 执行放行。")
+            lines.append("")
+        elif status == PACKAGE_REJECTED:
+            reason = wf.get("rejection_reason") or "（未填写）"
+            lines.append(f"> ⛔ 本包已被驳回并作废，禁止放行、禁止申报。驳回原因：{reason}")
+            lines.append(">")
+            lines.append("> 业务按驳回原因重新处理后，只能冻结新的申报包重新会签；"
+                         "旧包内容不可修改，旧会签意见不可挪用到新包。")
+            lines.append("")
 
     lines.append("## 一、申报采用值")
     lines.append("")
@@ -1566,4 +1944,10 @@ def export_markdown(package: dict) -> str:
         lines.append("")
     lines.append("---")
     lines.append("本文件由冻结时刻的数据库快照生成，后续资料版本更新不影响本申报包内容。")
+    if is_released:
+        lines.append(f"本包已经关务复核人、关务主管会签并由 {wf.get('released_by') or '—'} "
+                     f"于 {wf.get('released_at') or '—'} 放行，属正式申报依据。")
+    else:
+        lines.append(f"⛔ {INTERNAL_REVIEW_WATERMARK}：本包{'已被驳回作废、' if status == PACKAGE_REJECTED else ''}"
+                     "尚未完成会签放行流程，不得用于申报；放行后请重新下载正式版本。")
     return "\n".join(lines)

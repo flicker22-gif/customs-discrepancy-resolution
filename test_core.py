@@ -1,7 +1,9 @@
 """单元测试：比对引擎、幂等（版本更新/重复提交不产生第二条差异）、认领/补件/解决约束、
-截止提醒/升级（防刷屏、故障隔离）、供应商受限门户、Flask 冒烟。"""
+截止提醒/升级（防刷屏、故障隔离）、供应商受限门户、申报包会签/放行状态机、Flask 冒烟。"""
+import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 
@@ -506,6 +508,436 @@ class PackageTest(unittest.TestCase):
         core.freeze_package(self.conn, self.sid, actor="李")
         actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
         self.assertIn("package_frozen", actions)
+
+
+class PackageCountersignTest(unittest.TestCase):
+    """冻结→待复核→两人会签（不同人）→指定操作人放行，及全部异常路径。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "wf2.db")
+        self.conn = core.connect(self.db_path)
+        core.init_db(self.conn)
+        self.sid = core.create_shipment(self.conn, "CS-1", customer="甲", actor="t",
+                                        deadline="2026-09-20T10:00", warn_hours=24)
+        for src, qty in (("supplier", "1000"), ("forwarder", "1000"), ("warehouse", "1000")):
+            core.submit_document(self.conn, self.sid, src, "保温杯", qty, "C1", actor="t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _freeze(self, **kw):
+        r = core.freeze_package(self.conn, self.sid, actor="制单员", **kw)
+        row = self.conn.execute("SELECT * FROM declaration_package WHERE id=?",
+                                (r["id"],)).fetchone()
+        return r, row
+
+    def _approve_both(self, pid, customs="关务复核人赵", supervisor="关务主管钱",
+                      comments=("", "同意")):
+        core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, customs,
+                            core.REVIEW_APPROVE, comments[0])
+        return core.review_package(self.conn, pid, core.REVIEW_SUPERVISOR, supervisor,
+                                   core.REVIEW_APPROVE, comments[1])
+
+    def test_freeze_enters_pending_and_blocks_release_before_countersign(self):
+        r, row = self._freeze()
+        self.assertEqual(r["status"], core.PACKAGE_PENDING)
+        self.assertEqual(row["status"], core.PACKAGE_PENDING)
+        # 会签未完成：放行被拒
+        with self.assertRaises(core.PackageStateError):
+            core.release_package(self.conn, row["id"], actor="操作人孙")
+        # 单方会签后仍不能放行
+        core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "赵",
+                            core.REVIEW_APPROVE)
+        with self.assertRaises(core.PackageStateError):
+            core.release_package(self.conn, row["id"], actor="操作人孙")
+        self.assertEqual(self._status(row["id"]), core.PACKAGE_PENDING)
+
+    def test_reviewer_and_supervisor_must_differ(self):
+        _, row = self._freeze()
+        core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "同一个人",
+                            core.REVIEW_APPROVE)
+        # 同一人想兼任主管 → 拒绝，包仍停在待复核
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, row["id"], core.REVIEW_SUPERVISOR, "同一个人",
+                                core.REVIEW_APPROVE)
+        self.assertEqual(self._status(row["id"]), core.PACKAGE_PENDING)
+        self.assertEqual(len(core.list_package_reviews(self.conn, row["id"])), 1)
+        actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        self.assertIn("package_review_denied", actions)
+        # 换个不同的主管即可通过
+        r = core.review_package(self.conn, row["id"], core.REVIEW_SUPERVISOR, "主管钱",
+                                core.REVIEW_APPROVE)
+        self.assertEqual(r["status"], core.PACKAGE_APPROVED)
+
+    def test_reverse_role_order_same_rule(self):
+        _, row = self._freeze()
+        core.review_package(self.conn, row["id"], core.REVIEW_SUPERVISOR, "主管钱",
+                            core.REVIEW_APPROVE)
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "主管钱",
+                                core.REVIEW_APPROVE)
+
+    def test_reject_requires_reason_and_blocks_release(self):
+        _, row = self._freeze()
+        # 驳回不填原因 → 拒绝，状态不变
+        with self.assertRaises(ValueError):
+            core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_REJECT)
+        self.assertEqual(self._status(row["id"]), core.PACKAGE_PENDING)
+        # 主管先通过，复核人驳回 → 终态 rejected
+        core.review_package(self.conn, row["id"], core.REVIEW_SUPERVISOR, "钱",
+                            core.REVIEW_APPROVE, "同意")
+        r = core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_REJECT, "三方箱单号未复核，需补仓库签章件")
+        self.assertTrue(r["rejected"])
+        self.assertEqual(self._status(row["id"]), core.PACKAGE_REJECTED)
+        # 驳回后：不能放行、不能再会签
+        with self.assertRaises(core.PackageStateError):
+            core.release_package(self.conn, row["id"], actor="孙")
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, row["id"], core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_APPROVE)
+
+    def test_rejected_package_is_terminal_new_package_starts_afresh(self):
+        _, row1 = self._freeze()
+        pid1 = row1["id"]
+        core.review_package(self.conn, pid1, core.REVIEW_CUSTOMS, "赵",
+                            core.REVIEW_REJECT, "数量依据不足")
+        # 业务重新处理后冻结新包：新包待复核、包号递增，旧审批不会挪过来
+        r2 = core.freeze_package(self.conn, self.sid, actor="制单员")
+        self.assertEqual(r2["package_no"], 2)
+        self.assertFalse(r2["deduped"])
+        self.assertEqual(r2["status"], core.PACKAGE_PENDING)
+        self.assertEqual(core.list_package_reviews(self.conn, r2["id"]), [])
+        # 旧包仍旧是驳回终态，旧包内容未被修改
+        self.assertEqual(self._status(pid1), core.PACKAGE_REJECTED)
+        old_payload = json.loads(self.conn.execute(
+            "SELECT payload_json FROM declaration_package WHERE id=?", (pid1,)).fetchone()[0])
+        self.assertEqual(old_payload["package_no"], 1)
+
+    def test_repeated_click_same_role_is_idempotent_then_conflict(self):
+        _, row = self._freeze()
+        pid = row["id"]
+        core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "赵",
+                            core.REVIEW_APPROVE, "已核对")
+        # 完全相同的重复点击：幂等
+        r = core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_APPROVE, "已核对")
+        self.assertTrue(r.get("duplicate"))
+        self.assertEqual(len(core.list_package_reviews(self.conn, pid)), 1)
+        # 同人同角色但换了结论/意见：拒绝
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_REJECT, "改主意了")
+        # 另一个人想顶掉该角色：也拒绝
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "王",
+                                core.REVIEW_APPROVE)
+
+    def test_designated_operator_enforced_and_release_idempotent(self):
+        _, row = self._freeze(designated_operator="放行员孙")
+        pid = row["id"]
+        self._approve_both(pid)
+        # 非指定操作人不能放行
+        with self.assertRaises(core.PackageStateError):
+            core.release_package(self.conn, pid, actor="别人李")
+        self.assertEqual(self._status(pid), core.PACKAGE_APPROVED)
+        denied = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        self.assertIn("package_release_denied", denied)
+        # 指定操作人本人放行
+        r = core.release_package(self.conn, pid, actor="放行员孙")
+        self.assertEqual(r["status"], core.PACKAGE_RELEASED)
+        # 重复点击放行：本人幂等
+        r2 = core.release_package(self.conn, pid, actor="放行员孙")
+        self.assertTrue(r2["duplicate"])
+        # 别人再点：报错而非二次放行
+        with self.assertRaises(core.PackageStateError):
+            core.release_package(self.conn, pid, actor="别人李")
+
+    def test_release_requires_actor_name(self):
+        _, row = self._freeze()
+        self._approve_both(row["id"])
+        with self.assertRaises(ValueError):
+            core.release_package(self.conn, row["id"], actor="  ")
+
+    def test_released_package_is_terminal(self):
+        _, row = self._freeze()
+        pid = row["id"]
+        self._approve_both(pid)
+        core.release_package(self.conn, pid, actor="孙")
+        # 放行后不能再会签
+        with self.assertRaises(core.PackageStateError):
+            core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "赵",
+                                core.REVIEW_APPROVE)
+
+    def test_payload_json_never_mutated_by_workflow(self):
+        r = core.freeze_package(self.conn, self.sid, actor="制单员",
+                                designated_operator="孙")
+        pid = r["id"]
+        raw_before = self.conn.execute(
+            "SELECT payload_json FROM declaration_package WHERE id=?", (pid,)).fetchone()[0]
+        self._approve_both(pid)
+        core.release_package(self.conn, pid, actor="孙")
+        raw_after = self.conn.execute(
+            "SELECT payload_json FROM declaration_package WHERE id=?", (pid,)).fetchone()[0]
+        self.assertEqual(raw_after, raw_before)  # 会签/放行只写活表，不回改快照
+        pkg = core.get_package(self.conn, pid)
+        self.assertEqual(pkg["workflow"]["status"], core.PACKAGE_RELEASED)
+        self.assertFalse(pkg["workflow"]["is_internal"])
+        self.assertEqual(pkg["_document_class"], "released_declaration")
+        self.assertEqual(len(pkg["workflow"]["reviews"]), 2)
+
+    def test_freeze_idempotency_key_dedupes_double_click(self):
+        key = "form-instance-abc"
+        r1 = core.freeze_package(self.conn, self.sid, actor="制单员", idempotency_key=key)
+        r2 = core.freeze_package(self.conn, self.sid, actor="制单员", idempotency_key=key)
+        self.assertTrue(r2["deduped"])
+        self.assertEqual(r2["id"], r1["id"])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM declaration_package WHERE shipment_id=?",
+            (self.sid,)).fetchone()[0], 1)
+        # 无防重键的两次冻结 → 两个包
+        r3 = core.freeze_package(self.conn, self.sid, actor="制单员")
+        self.assertFalse(r3["deduped"])
+        self.assertNotEqual(r3["id"], r1["id"])
+
+    def test_freeze_with_open_discrepancy_still_requires_confirm(self):
+        core.submit_document(self.conn, self.sid, "forwarder", "保温杯", "1099", "C1",
+                             actor="t")
+        with self.assertRaises(ValueError):
+            core.freeze_package(self.conn, self.sid, actor="制单员")
+        r = core.freeze_package(self.conn, self.sid, actor="制单员", confirm=True)
+        pkg = core.get_package(self.conn, r["id"])
+        self.assertEqual(pkg["open_items"], 1)
+        self.assertEqual(pkg["workflow"]["status"], core.PACKAGE_PENDING)
+
+    def test_full_workflow_audit_trail(self):
+        _, row = self._freeze(designated_operator="孙")
+        pid = row["id"]
+        self._approve_both(pid)
+        core.release_package(self.conn, pid, actor="孙")
+        actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        for a in ("package_frozen", "package_review_approved", "package_countersigned",
+                  "package_released"):
+            self.assertIn(a, actions)
+        # 每条会签都留下操作人和时间
+        reviews = core.list_package_reviews(self.conn, pid)
+        self.assertEqual({r["role"] for r in reviews},
+                         {core.REVIEW_CUSTOMS, core.REVIEW_SUPERVISOR})
+        self.assertTrue(all(r["actor"] and r["created_at"] for r in reviews))
+        self.assertEqual({r["actor"] for r in reviews}, {"关务复核人赵", "关务主管钱"})
+
+    def test_concurrent_same_role_review_only_one_wins(self):
+        r = core.freeze_package(self.conn, self.sid, actor="制单员")
+        pid = r["id"]
+        errors = []
+
+        def submit(actor_name):
+            conn = core.connect(self.db_path)
+            try:
+                core.review_package(conn, pid, core.REVIEW_CUSTOMS, actor_name,
+                                    core.REVIEW_APPROVE)
+            except Exception as e:  # noqa: BLE001
+                errors.append((actor_name, type(e).__name__))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=submit, args=(f"复核人{i}",)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 恰好一条意见落库；另一个请求拿到明确错误，没有静默覆盖
+        rows = core.list_package_reviews(self.conn, pid)
+        same_role = [x for x in rows if x["role"] == core.REVIEW_CUSTOMS]
+        self.assertEqual(len(same_role), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][1], "PackageStateError")
+
+    def test_concurrent_release_only_first_succeeds(self):
+        r = core.freeze_package(self.conn, self.sid, actor="制单员")
+        pid = r["id"]
+        self._approve_both(pid)
+        outcomes = []
+
+        def release():
+            conn = core.connect(self.db_path)
+            try:
+                outcomes.append(core.release_package(conn, pid, actor="孙"))
+            except Exception as e:  # noqa: BLE001
+                outcomes.append(e)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=release) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(sum(1 for o in outcomes if isinstance(o, dict)), 2)
+        self.assertEqual(sum(1 for o in outcomes if isinstance(o, dict) and o.get("duplicate")),
+                         1)
+        self.assertEqual(self.conn.execute(
+            "SELECT released_by FROM declaration_package WHERE id=?", (pid,)).fetchone()[0],
+            "孙")
+
+    def test_export_marks_internal_vs_released(self):
+        r = core.freeze_package(self.conn, self.sid, actor="制单员",
+                                designated_operator="孙")
+        pid = r["id"]
+        # 待复核：md/json 都带内部水印
+        pkg = core.get_package(self.conn, pid)
+        md = core.export_markdown(pkg)
+        self.assertIn(core.INTERNAL_REVIEW_WATERMARK, md)
+        self.assertEqual(pkg["_document_class"], "internal_review_only")
+        # 驳回包：明确作废，禁止申报
+        core.review_package(self.conn, pid, core.REVIEW_CUSTOMS, "赵",
+                            core.REVIEW_REJECT, "依据不足")
+        md = core.export_markdown(core.get_package(self.conn, pid))
+        self.assertIn("已驳回", md)
+        self.assertIn("禁止申报", md)
+        # 新包走完会签+放行：正式版无水印、有放行人与时间
+        r2 = core.freeze_package(self.conn, self.sid, actor="制单员")
+        self._approve_both(r2["id"])
+        core.release_package(self.conn, r2["id"], actor="孙")
+        pkg2 = core.get_package(self.conn, r2["id"])
+        md2 = core.export_markdown(pkg2)
+        self.assertIn("正式申报包（已放行）", md2)
+        self.assertNotIn(core.INTERNAL_REVIEW_WATERMARK, md2)
+        self.assertIn("孙", md2)
+        self.assertIn("关务复核人赵", md2)  # 会签意见与时间随正式件输出
+
+    def _status(self, pid):
+        return self.conn.execute("SELECT status FROM declaration_package WHERE id=?",
+                                 (pid,)).fetchone()[0]
+
+
+class LegacyPackageMigrationTest(unittest.TestCase):
+    """旧数据库（无 status 列、无 package_review 表）迁移：旧包不失效、归档为已放行并审计。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "legacy.db")
+        conn = core.connect(self.db_path)
+        # 手工建一套“会签功能上线前”的最小旧结构并塞一个旧冻结包
+        conn.executescript("""
+        CREATE TABLE shipment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT UNIQUE NOT NULL,
+            customer TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open', deadline TEXT,
+            warn_hours INTEGER NOT NULL DEFAULT 24, created_at TEXT NOT NULL);
+        CREATE TABLE document (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            source TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+            product_name TEXT, quantity TEXT, carton_no TEXT,
+            submitted_by TEXT NOT NULL DEFAULT '', submitted_at TEXT NOT NULL,
+            UNIQUE(shipment_id, source));
+        CREATE TABLE discrepancy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            field TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+            values_json TEXT NOT NULL DEFAULT '{}', owner TEXT,
+            supplement_note TEXT NOT NULL DEFAULT '', is_reconciled INTEGER NOT NULL DEFAULT 0,
+            episode INTEGER NOT NULL DEFAULT 1, rule_version INTEGER,
+            rule_evidence_json TEXT NOT NULL DEFAULT '{}', close_reason TEXT,
+            active_waiver_id INTEGER, first_found_at TEXT NOT NULL,
+            last_changed_at TEXT NOT NULL, reconciled_at TEXT, resolved_at TEXT,
+            UNIQUE(shipment_id, field));
+        CREATE TABLE supplement_token (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL,
+            shipment_id INTEGER NOT NULL, source TEXT NOT NULL, fields TEXT NOT NULL,
+            contact TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, expires_at TEXT, used_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT, revoked INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE reminder_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            discrepancy_id INTEGER, level TEXT NOT NULL, episode INTEGER NOT NULL,
+            created_at TEXT NOT NULL, UNIQUE(discrepancy_id, level, episode));
+        CREATE TABLE notification (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL,
+            channel TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, sent_at TEXT);
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL,
+            created_at TEXT NOT NULL);
+        CREATE TABLE declaration_package (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            package_no INTEGER NOT NULL, frozen_by TEXT NOT NULL DEFAULT '',
+            frozen_at TEXT NOT NULL, declared_fields TEXT NOT NULL DEFAULT '',
+            open_items INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL,
+            UNIQUE(shipment_id, package_no));
+        CREATE TABLE tolerance_rule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            field TEXT NOT NULL, version INTEGER NOT NULL, mode TEXT NOT NULL,
+            config_json TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, revoked_by TEXT NOT NULL DEFAULT '', revoked_at TEXT,
+            UNIQUE(shipment_id, field, version));
+        CREATE TABLE waiver (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shipment_id INTEGER NOT NULL,
+            discrepancy_id INTEGER NOT NULL, episode INTEGER NOT NULL,
+            reason TEXT NOT NULL, granted_by TEXT NOT NULL, granted_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            revoked_by TEXT NOT NULL DEFAULT '', ended_at TEXT,
+            basis_json TEXT NOT NULL DEFAULT '{}');
+        """)
+        conn.execute(
+            "INSERT INTO shipment (ref, status, created_at) VALUES ('OLD-1', 'resolved', ?)",
+            (core.now(),))
+        for src in core.SOURCES:
+            conn.execute(
+                "INSERT INTO document (shipment_id, source, version, product_name, quantity, "
+                "carton_no, submitted_by, submitted_at) VALUES (1, ?, 1, '保温杯', '1000', "
+                "'C1', '老', ?)",
+                (src, core.now()))
+        # 用与上线版本相同的快照构造器生成旧包内容（旧库尚无 status 列）
+        legacy_snapshot = core.build_snapshot(conn, 1)
+        legacy_snapshot["package_no"] = 1
+        legacy_snapshot["frozen_by"] = "老关务"
+        legacy_snapshot["frozen_at"] = core.now()
+        conn.execute(
+            "INSERT INTO declaration_package (shipment_id, package_no, frozen_by, frozen_at, "
+            "declared_fields, open_items, payload_json) VALUES (1, 1, '老关务', ?, 'x', 0, ?)",
+            (core.now(), json.dumps(legacy_snapshot, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+
+    def test_legacy_packages_backfilled_and_exportable(self):
+        conn = core.connect(self.db_path)
+        core.init_db(conn)  # 触发迁移
+        row = conn.execute("SELECT status, released_by FROM declaration_package WHERE id=1"
+                           ).fetchone()
+        self.assertEqual(row["status"], core.PACKAGE_RELEASED)
+        self.assertEqual(row["released_by"], "系统迁移")
+        # 旧包仍可正常导出（现有冻结包/导出入口不失效）
+        pkg = core.get_package(conn, 1)
+        self.assertFalse(pkg["workflow"]["is_internal"])
+        md = core.export_markdown(pkg)
+        self.assertIn("正式申报包（已放行）", md)
+        actions = [l["action"] for l in core.list_logs(conn, 1)]
+        self.assertIn("package_legacy_released", actions)
+        # 迁移幂等：再 init 一次不重复审计、不动状态
+        core.init_db(conn)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='package_legacy_released'").fetchone()[0]
+        self.assertEqual(n, 1)
+        conn.close()
+
+    def test_freeze_after_migration_starts_pending(self):
+        conn = core.connect(self.db_path)
+        core.init_db(conn)
+        # setUp 已用旧结构写入三方一致资料，迁移后冻新包应正常走待复核流程
+        r = core.freeze_package(conn, 1, actor="新关务")
+        self.assertEqual(r["package_no"], 2)
+        self.assertEqual(r["status"], core.PACKAGE_PENDING)
+        rows = conn.execute("SELECT package_no, status FROM declaration_package ORDER BY package_no"
+                            ).fetchall()
+        self.assertEqual([(r0["package_no"], r0["status"]) for r0 in rows],
+                         [(1, core.PACKAGE_RELEASED), (2, core.PACKAGE_PENDING)])
+        conn.close()
 
 
 class ToleranceRuleTest(unittest.TestCase):
@@ -1053,6 +1485,129 @@ class ToleranceWaiverFlaskTest(unittest.TestCase):
         r = c.post("/waivers/1/revoke", data={"actor": "关务主管"},
                    follow_redirects=True)
         self.assertIn("已复用原差异行开启新一轮提醒", r.get_data(as_text=True))
+
+
+class PackageWorkflowFlaskTest(unittest.TestCase):
+    def setUp(self):
+        os.environ["CUSTOMS_DB"] = os.path.join(tempfile.mkdtemp(), "pw.db")
+        import app as flask_app
+        self.app = flask_app.app
+        self.c = flask_app.app.test_client()
+        self.c.post("/shipments/new", data={"ref": "WEB-PW", "actor": "林"})
+        for src in ("supplier", "forwarder", "warehouse"):
+            self.c.post("/shipments/1/documents",
+                        data={"source": src, "product_name": "保温杯", "quantity": "1000",
+                              "carton_no": "C1", "actor": "王"})
+
+    def _freeze(self, actor="制单员", designated="放行员孙"):
+        page = self.c.get("/shipments/1").get_data(as_text=True)
+        import re
+        m = re.search(r'name="idem_key" value="([^"]+)"', page)
+        self.assertIsNotNone(m)
+        r = self.c.post("/shipments/1/packages",
+                        data={"actor": actor, "designated_operator": designated,
+                              "idem_key": m.group(1)},
+                        follow_redirects=True)
+        self.assertIn("进入待复核", r.get_data(as_text=True))
+
+    def test_review_release_http_happy_path_and_watermark(self):
+        self._freeze()
+        # 未放行：下载件带内部水印，文件名带“内部复核稿”
+        md = self.c.get("/packages/1/export.md")
+        self.assertIn(core.INTERNAL_REVIEW_WATERMARK, md.get_data(as_text=True))
+        self.assertIn("内部复核稿", md.headers["Content-Disposition"])
+        blob = self.c.get("/packages/1/export.json").get_data(as_text=True)
+        self.assertIn('"internal_review_only"', blob)
+
+        page = self.c.get("/shipments/1").get_data(as_text=True)
+        self.assertIn("待复核", page)
+        # 同一人兼任两角色 → 被拒
+        self.c.post("/packages/1/reviews",
+                    data={"role": "customs_reviewer", "actor": "赵", "decision": "approve",
+                          "comment": "已核对"})
+        r = self.c.post("/packages/1/reviews",
+                        data={"role": "supervisor", "actor": "赵", "decision": "approve"},
+                        follow_redirects=True)
+        self.assertIn("必须是不同人员", r.get_data(as_text=True))
+        # 驳回必须填原因（先试空原因驳回另一角色）
+        # 不同主管通过 → 会签完成
+        r = self.c.post("/packages/1/reviews",
+                        data={"role": "supervisor", "actor": "钱", "decision": "approve",
+                              "comment": "同意"},
+                        follow_redirects=True)
+        self.assertIn("两方会签均已通过", r.get_data(as_text=True))
+        # 非指定操作人放行 → 拒绝
+        r = self.c.post("/packages/1/release", data={"actor": "外人"},
+                        follow_redirects=True)
+        self.assertIn("无权放行", r.get_data(as_text=True))
+        # 指定操作人放行
+        r = self.c.post("/packages/1/release", data={"actor": "放行员孙"},
+                        follow_redirects=True)
+        self.assertIn("申报包已放行", r.get_data(as_text=True))
+        # 已放行：正式件无水印、文件名无内部稿后缀、JSON 标记为正式
+        md = self.c.get("/packages/1/export.md").get_data(as_text=True)
+        self.assertIn("正式申报包（已放行）", md)
+        self.assertNotIn(core.INTERNAL_REVIEW_WATERMARK, md)
+        headers = self.c.get("/packages/1/export.md").headers["Content-Disposition"]
+        self.assertNotIn("内部复核稿", headers)
+        blob = self.c.get("/packages/1/export.json").get_data(as_text=True)
+        self.assertIn('"released_declaration"', blob)
+        self.assertIn("放行员孙", blob)
+        # 放行后重复点击：幂等提示
+        r = self.c.post("/packages/1/release", data={"actor": "放行员孙"},
+                        follow_redirects=True)
+        self.assertIn("重复点击已忽略", r.get_data(as_text=True))
+
+    def test_reject_http_blocks_and_new_package_resets(self):
+        self._freeze()
+        r = self.c.post("/packages/1/reviews",
+                        data={"role": "customs_reviewer", "actor": "赵",
+                              "decision": "reject", "comment": ""},
+                        follow_redirects=True)
+        self.assertIn("驳回必须填写原因", r.get_data(as_text=True))
+        r = self.c.post("/packages/1/reviews",
+                        data={"role": "customs_reviewer", "actor": "赵",
+                              "decision": "reject", "comment": "缺仓库签章"},
+                        follow_redirects=True)
+        self.assertIn("已驳回", r.get_data(as_text=True))
+        # 驳回包的下载件明确作废
+        md = self.c.get("/packages/1/export.md").get_data(as_text=True)
+        self.assertIn("作废包", md)
+        self.assertIn("缺仓库签章", md)
+        # 放行尝试被拒
+        r = self.c.post("/packages/1/release", data={"actor": "放行员孙"},
+                        follow_redirects=True)
+        self.assertIn("已被驳回", r.get_data(as_text=True))
+        # 冻结新包：#2 待复核，没有挪过来的旧审批
+        self._freeze(designated="")
+        page = self.c.get("/shipments/1").get_data(as_text=True)
+        self.assertIn("#2", page)
+        pkg2 = json.loads(self.c.get("/packages/2/export.json").get_data(as_text=True))
+        self.assertEqual(pkg2["workflow"]["status"], core.PACKAGE_PENDING)
+        self.assertEqual(pkg2["workflow"]["reviews"], [])
+
+    def test_freeze_double_submit_with_same_key_dedupes(self):
+        import re
+        import core as _core
+        page = self.c.get("/shipments/1").get_data(as_text=True)
+        key = re.search(r'name="idem_key" value="([^"]+)"', page).group(1)
+        # 同一表单实例（同防重键）连续 POST 两次，模拟双击/重放
+        self.c.post("/shipments/1/packages",
+                    data={"actor": "制单员", "idem_key": key})
+        r = self.c.post("/shipments/1/packages",
+                        data={"actor": "制单员", "idem_key": key},
+                        follow_redirects=True)
+        self.assertIn("冻结请求重复", r.get_data(as_text=True))
+        pkgs = _core.list_packages(_core.connect(os.environ["CUSTOMS_DB"]), 1)
+        self.assertEqual(len(pkgs), 1)
+        # 新页面给出新 key → 再冻得到 #2
+        page = self.c.get("/shipments/1").get_data(as_text=True)
+        key2 = re.search(r'name="idem_key" value="([^"]+)"', page).group(1)
+        self.assertNotEqual(key2, key)
+        self.c.post("/shipments/1/packages",
+                    data={"actor": "制单员", "idem_key": key2})
+        pkgs = _core.list_packages(_core.connect(os.environ["CUSTOMS_DB"]), 1)
+        self.assertEqual([p["package_no"] for p in pkgs], [1, 2])
 
 
 if __name__ == "__main__":

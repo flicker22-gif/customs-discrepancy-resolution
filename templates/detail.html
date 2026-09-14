@@ -443,38 +443,118 @@
 </div>
 
 <div class="card">
-  <h2>申报包冻结与导出（不可变快照）</h2>
-  <p class="muted" style="margin-top:0">冻结会把<b>当前采用的三方资料版本</b>（含提交人、提交时间）、<b>容差规则版本链与命中依据</b>、<b>豁免证据</b>（原因、操作人、到期、批准时的三方值）和<b>全部差异处理结论</b>固化为一个申报包。冻结后改规则/改资料都不影响本包；需要新快照时再冻下一包。豁免期内的差异不算“未解决”，可直接冻结。</p>
+  <h2>申报包冻结 · 会签 · 放行（不可变快照）</h2>
+  <p class="muted" style="margin-top:0">冻结只固化<b>当时依据</b>（三方资料版本与提交人/时间、容差规则版本链与命中依据、豁免证据、差异处理结论）。冻结后包进入<b>待复核</b>：必须由<b>关务复核人与关务主管两个不同的人</b>分别留下意见和时间，两人都通过后由<b>指定放行操作人</b>放行，包才成为正式申报依据。任一驳回必须写原因，驳回即作废——重新处理后只能冻结新包，旧包内容与旧审批不可修改、不可挪用。未放行包的下载件一律带“仅供内部复核”水印。豁免期内的差异不算“未解决”，可直接冻结。</p>
   <form method="post" action="{{ url_for('freeze_package', shipment_id=s['id']) }}">
+    <input type="hidden" name="idem_key" value="{{ freeze_idem }}">
     <div class="actions">
       <div class="grow"><label>冻结操作人</label><input name="actor" placeholder="姓名"></div>
+      <div class="grow"><label>指定放行操作人（会签通过后仅其本人可放行；留空=不限制）</label>
+        <input name="designated_operator" placeholder="放行操作人姓名（可留空）"></div>
       <div class="grow" style="flex:2">
-        <label>带未解决差异冻结（默认阻止；确认后风险会写入申报包并留痕）</label>
+        <label>带未解决差异冻结（默认阻止；确认后风险写入申报包并留痕）</label>
         <label style="font-size:13px;color:#1f2933;display:flex;align-items:center;gap:6px;margin-top:8px">
           <input type="checkbox" name="confirm_open" value="1" style="width:auto">
           我确认在仍有未解决差异的情况下带差异申报，自行承担风险
         </label>
       </div>
-      <button type="submit" class="green">冻结当前状态为申报包</button>
+      <button type="submit" class="green">冻结为申报包（进入待复核）</button>
     </div>
   </form>
   {% if packages %}
-  <table style="margin-top:14px">
-    <tr><th>包号</th><th>冻结时间</th><th>冻结人</th><th>冻结时采用值</th><th>遗留未解决</th><th>导出</th></tr>
-    {% for p in packages %}
-    <tr>
-      <td><b>#{{ p['package_no'] }}</b></td>
-      <td class="muted">{{ p['frozen_at'].replace('T',' ') }}</td>
-      <td>{{ p['frozen_by'] }}</td>
-      <td style="font-size:12px">{{ p['declared_fields'] }}</td>
-      <td>{% if p['open_items'] %}<span class="badge b-open">{{ p['open_items'] }} 处（带差异申报）</span>{% else %}<span class="badge b-resolved">0</span>{% endif %}</td>
-      <td>
-        <a href="{{ url_for('export_package', package_id=p['id'], fmt='md') }}">下载核对单 .md</a> ·
-        <a href="{{ url_for('export_package', package_id=p['id'], fmt='json') }}">原始快照 .json</a>
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
+  {% for p in packages %}
+  {% set pkg = p['row'] %}
+  <div style="border:1px solid #e0e6ed;border-radius:8px;padding:12px 14px;margin-top:14px">
+    <div class="actions" style="align-items:flex-start">
+      <div>
+        <b>申报包 #{{ pkg['package_no'] }}</b>
+        {% if pkg['status'] == pkg_constants['released'] %}
+          <span class="badge b-resolved">✓ {{ p['status_label'] }}</span>
+        {% elif pkg['status'] == pkg_constants['rejected'] %}
+          <span class="badge b-open">✗ {{ p['status_label'] }}</span>
+        {% else %}
+          <span class="badge b-claimed">⛔ 内部复核中</span>
+        {% endif %}
+        <div class="muted" style="font-size:12px;margin-top:4px">
+          冻结于 {{ pkg['frozen_at'].replace('T',' ') }}，冻结人 {{ pkg['frozen_by'] }}
+          {% if pkg['designated_operator'] %}；指定放行操作人：<b>{{ pkg['designated_operator'] }}</b>{% endif %}
+        </div>
+        <div style="font-size:12px;margin-top:4px">{{ pkg['declared_fields'] }}</div>
+        {% if pkg['open_items'] %}<div class="badge b-open" style="margin-top:4px">带 {{ pkg['open_items'] }} 处未解决差异申报（已确认留痕）</div>{% endif %}
+      </div>
+      <div style="text-align:right;white-space:nowrap">
+        {% if p['is_internal'] %}
+          <span class="muted" style="font-size:12px">⛔ 内部复核稿（非正式申报依据）：</span><br>
+        {% else %}
+          <span class="muted" style="font-size:12px">✓ 正式放行包：</span><br>
+        {% endif %}
+        <a href="{{ url_for('export_package', package_id=pkg['id'], fmt='md') }}">
+          {{ '下载核对单 .md' if not p['is_internal'] else '内部核对单 .md（带水印）' }}</a> ·
+        <a href="{{ url_for('export_package', package_id=pkg['id'], fmt='json') }}">
+          {{ '正式快照 .json' if not p['is_internal'] else '内部快照 .json（带水印）' }}</a>
+      </div>
+    </div>
+
+    {# ---------- 会签记录 ---------- #}
+    <table style="margin-top:8px">
+      <tr><th>会签角色</th><th>操作人</th><th>结论</th><th>意见 / 驳回原因</th><th>时间</th></tr>
+      {% for role_key, role_name in review_role_labels.items() %}
+      {% set r = p['review_by_role'].get(role_key) %}
+      <tr>
+        <td>{{ role_name }}</td>
+        {% if r %}
+        <td>{{ r['actor'] }}</td>
+        <td>{% if r['decision'] == 'approve' %}<span class="badge b-resolved">通过</span>
+            {% else %}<span class="badge b-open">驳回</span>{% endif %}</td>
+        <td>{{ r['comment'] or '—' }}</td>
+        <td class="muted">{{ r['created_at'].replace('T',' ') }}</td>
+        {% else %}
+        <td colspan="4" class="muted">待会签（须与另一角色为不同人员）</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </table>
+
+    {# ---------- 待复核：两个角色各自的审批表单 ---------- #}
+    {% if pkg['status'] == pkg_constants['pending'] %}
+    <div class="actions" style="margin-top:8px;align-items:flex-start">
+      {% for role_key, role_name in review_role_labels.items() %}
+      {% if not p['review_by_role'].get(role_key) %}
+      <form method="post" action="{{ url_for('review_package', package_id=pkg['id']) }}"
+            style="flex:1;border:1px dashed #c0ccda;border-radius:6px;padding:8px 10px">
+        <input type="hidden" name="role" value="{{ role_key }}">
+        <b>{{ role_name }}会签</b>
+        <input name="actor" placeholder="本人姓名（不得兼任另一角色）" style="margin:6px 0;width:100%;box-sizing:border-box">
+        <input name="comment" placeholder="复核意见（驳回时必须填写原因）" style="width:100%;box-sizing:border-box">
+        <div class="actions" style="margin-top:6px">
+          <button name="decision" value="approve" class="green">复核通过</button>
+          <button name="decision" value="reject"
+                  onclick="return confirm('驳回后该包立即作废且不能放行，确认驳回？');">驳回</button>
+        </div>
+      </form>
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% elif pkg['status'] == pkg_constants['approved'] %}
+    <form method="post" action="{{ url_for('release_package', package_id=pkg['id']) }}" class="actions" style="margin-top:8px">
+      <div class="grow">
+        <label>放行操作人{% if pkg['designated_operator'] %}（仅限 <b>{{ pkg['designated_operator'] }}</b> 本人）{% endif %}</label>
+        <input name="actor" placeholder="操作人姓名" {% if pkg['designated_operator'] %}value="{{ pkg['designated_operator'] }}"{% endif %}>
+      </div>
+      <button type="submit" class="green">执行放行（成为正式申报依据）</button>
+    </form>
+    {% elif pkg['status'] == pkg_constants['rejected'] %}
+    <div style="margin-top:8px;padding:8px 10px;background:var(--red-bg);border-radius:6px;font-size:13px">
+      ⛔ 本包已被 {{ p['rejection']['actor'] }}（{{ review_role_labels[p['rejection']['role']] }}）驳回：{{ p['rejection']['comment'] }}。
+      放行已阻止，包内容与审批记录不可修改；请按原因重新处理后，在上方<b>冻结一个新的申报包</b>重新走会签。
+    </div>
+    {% elif pkg['status'] == pkg_constants['released'] %}
+    <div style="margin-top:8px;font-size:13px">
+      ✓ 已由 <b>{{ pkg['released_by'] }}</b> 于 {{ pkg['released_at'].replace('T',' ') }} 放行，本页下载件为正式申报依据。
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
   {% endif %}
 </div>
 

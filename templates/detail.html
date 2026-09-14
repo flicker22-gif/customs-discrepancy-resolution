@@ -54,6 +54,7 @@
       <td>
         {% if r['nstatus'] == 'sent' %}<span class="badge b-resolved">已发送</span>
         {% elif r['nstatus'] == 'failed' %}<span class="badge b-open">发送失败·重试 {{ r['attempts'] }} 次</span>
+        {% elif r['nstatus'] == 'cancelled' %}<span class="badge b-waived">已撤销（豁免）</span>
         {% else %}<span class="badge b-claimed">待发送</span>{% endif %}
       </td>
       <td class="muted">{{ r['created_at'].replace('T',' ') }}</td>
@@ -82,8 +83,14 @@
         {% if row.discrepancy and row.discrepancy['status'] == 'resolved' %}
           <span class="badge b-resolved">已解决</span>
         {% elif row.discrepancy and row.discrepancy['is_reconciled'] %}
+          {% if row.discrepancy['close_reason'] == 'tolerated' %}
+          <span class="badge b-reconciled">容差内一致（v{{ row.discrepancy['rule_version'] }}），待确认</span>
+          {% else %}
           <span class="badge b-reconciled">✓ 核对一致，待确认</span>
-        {% elif row.conflict %}
+          {% endif %}
+        {% elif row.tolerated %}
+          <span class="badge b-reconciled">≒ 容差内（v{{ row.rule_hit.version }}），不列为差异</span>
+        {% elif row.strict_conflict %}
           <span class="badge b-open">✗ 不一致</span>
         {% else %}
           <span class="muted">一致 / 待齐套</span>
@@ -92,7 +99,115 @@
     </tr>
     {% endfor %}
   </table>
-  <p class="muted" style="margin-bottom:0">说明：仅一方提交时不产生差异；至少两方提交且归一化后不一致才算冲突（数量忽略千分位/小数尾零，品名与箱单号忽略空格与大小写）。</p>
+  <p class="muted" style="margin-bottom:0">说明：仅一方提交时不产生差异；至少两方提交且归一化后不一致才算冲突（数量忽略千分位/小数尾零，品名与箱单号忽略空格与大小写）。配置容差规则后，差异在允许范围内会按命中规则视为一致（保留原始三方值与规则版本）；历史上未配置规则的字段继续严格比对。</p>
+</div>
+
+<div class="card">
+  <h2>容差规则（按字段版本化维护，改规则=新版本，旧版本保留为冻结证据）</h2>
+  {% for f in ['quantity','product_name','carton_no'] %}
+  {% set cur = rule_current.get(f) %}
+  {% set hist = rule_history.get(f, []) %}
+  {% set cfg = cur['config_json']|from_json if cur else {} %}
+  <div class="rule-block">
+    <div class="rule-head">
+      <b>{{ field_labels[f] }}</b>
+      {% if cur %}
+        <span class="badge b-reconciled">现行 v{{ cur['version'] }}</span>
+        {% if f == 'quantity' %}
+          {% if cur['mode'] == 'abs' %}±{{ cfg['abs'] }}{% else %}±{{ cfg['pct'] }}%（按{{ {'max':'最大值','min':'最小值','mean':'平均值'}.get(cfg.get('basis','max')) }}）{% endif %}
+          ，容差内采用「{{ source_labels[cfg.get('adopt_source','supplier')] }}」值
+        {% else %}
+          别名容差，容差内采用「{{ source_labels[cfg.get('adopt_source','supplier')] }}」值
+        {% endif %}
+        <span class="muted">· {{ cur['created_by'] or '系统' }} 于 {{ cur['created_at'] }}</span>
+        {% if cur['note'] %}<div class="muted">备注：{{ cur['note'] }}</div>{% endif %}
+      {% else %}
+        <span class="badge b-open">未配置 → 严格比对</span>
+      {% endif %}
+    </div>
+    <details>
+      <summary class="muted" style="cursor:pointer">{% if hist %}版本历史（{{ hist|length }}）{% else %}维护规则{% endif %}</summary>
+      <form method="post" action="{{ url_for('save_rule', shipment_id=s['id']) }}" style="margin-top:10px">
+        <input type="hidden" name="field" value="{{ f }}">
+        {% if f == 'quantity' %}
+        <div class="grid g4">
+          <div>
+            <label>容差方式</label>
+            <select name="qty_mode" id="qmode-{{ f }}" onchange="document.querySelectorAll('.qabs-{{ f }},.qpct-{{ f }}').forEach(e=>e.style.display='none');document.querySelector('.'+(this.value==='abs'?'qabs':'qpct')+'-{{ f }}').style.display=''">
+              <option value="abs" {{ 'selected' if cur and cur['mode']=='abs' }}>绝对数量差</option>
+              <option value="pct" {{ 'selected' if cur and cur['mode']=='pct' }}>百分比</option>
+            </select>
+          </div>
+          <div class="qabs-{{ f }}" style="{{ 'display:none' if cur and cur['mode']=='pct' }}">
+            <label>允许绝对差（±，如 50）</label>
+            <input name="abs" value="{{ cfg['abs'] if cur and cur['mode']=='abs' else '' }}" placeholder="如 50">
+          </div>
+          <div class="qpct-{{ f }}" style="{{ 'display:none' if not cur or cur['mode']!='pct' }}">
+            <label>允许百分比（±%，如 2）</label>
+            <input name="pct" value="{{ cfg['pct'] if cur and cur['mode']=='pct' else '' }}" placeholder="如 2">
+          </div>
+          <div class="qpct-{{ f }}" style="{{ 'display:none' if not cur or cur['mode']!='pct' }}">
+            <label>百分比基准</label>
+            <select name="basis">
+              {% for b,bl in [('max','最大值'),('min','最小值'),('mean','平均值')] %}
+              <option value="{{ b }}" {{ 'selected' if cfg.get('basis','max')==b }}>{{ bl }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label>容差内申报采用哪方值</label>
+            <select name="adopt_source">
+              {% for src in sources %}<option value="{{ src }}" {{ 'selected' if cfg.get('adopt_source','supplier')==src }}>{{ source_labels[src] }}</option>{% endfor %}
+            </select>
+          </div>
+        </div>
+        {% else %}
+        <div class="grid g2">
+          <div>
+            <label>别名组（每行一组，组内用 / 分隔；落在同组内即视为一致）</label>
+            <textarea name="aliases" rows="2" placeholder="如：不锈钢杯/保温杯&#10;CBMU123/CBMU-123">{{ cfg['aliases'] if cur else '' }}</textarea>
+          </div>
+          <div>
+            <label>容差内申报采用哪方值</label>
+            <select name="adopt_source">
+              {% for src in sources %}<option value="{{ src }}" {{ 'selected' if cfg.get('adopt_source','supplier')==src }}>{{ source_labels[src] }}</option>{% endfor %}
+            </select>
+          </div>
+        </div>
+        {% endif %}
+        <div class="actions">
+          <div class="grow"><label>变更原因/备注（随版本留痕）</label><input name="note" placeholder="如 海关允许 2% 短装"></div>
+          <div class="grow"><label>操作人</label><input name="actor" placeholder="姓名"></div>
+          <button type="submit">{{ '发布新版本 v' ~ (cur['version'] + 1) if cur else '发布 v1' }}</button>
+          {% if cur %}
+          <button type="submit" class="ghost" formaction="{{ url_for('revoke_rule', shipment_id=s['id']) }}"
+                  formnovalidate
+                  onclick="return confirm('停用后该字段恢复严格比对，容差内的差异会重新暴露并恢复催办，确定？');">停用现行规则</button>
+          {% endif %}
+        </div>
+      </form>
+      {% if hist|length > 1 %}
+      <table style="margin-top:8px;font-size:12px">
+        <tr><th>版本</th><th>状态</th><th>规则</th><th>维护人</th><th>时间</th><th>备注</th></tr>
+        {% for h in hist %}
+        {% set hcfg = h['config_json']|from_json %}
+        <tr>
+          <td>v{{ h['version'] }}</td>
+          <td>{% if h['status']=='active' %}<span class="badge b-reconciled">现行</span>
+              {% elif h['status']=='revoked' %}<span class="badge b-open">已停用</span>
+              {% else %}<span class="badge b-claimed">被新版本取代</span>{% endif %}</td>
+          <td>{% if h['mode']=='abs' %}±{{ hcfg['abs'] }}{% elif h['mode']=='pct' %}±{{ hcfg['pct']}}%（按{{ {'max':'最大值','min':'最小值','mean':'平均值'}.get(hcfg.get('basis','max')) }}）{% else %}{{ hcfg['aliases']|replace('\n','；') }}{% endif %}</td>
+          <td>{{ h['created_by'] or '—' }}</td>
+          <td class="muted">{{ h['created_at'] }}</td>
+          <td class="muted">{{ h['note'] or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% endif %}
+    </details>
+  </div>
+  {% endfor %}
+  <p class="muted" style="margin-bottom:0">规则只影响重核时刻：发布新版本/停用都会自动整票重核。已冻结申报包保存冻结当时的规则版本，不会被后来的配置改写。</p>
 </div>
 
 <div class="card">
@@ -132,14 +247,22 @@
   {% endif %}
   {% for c in cards %}
   {% set d = c.row %}
-  <div class="disc {{ 'resolved' if d['status'] == 'resolved' else ('reconciled' if d['is_reconciled'] else '') }}">
+  <div class="disc {{ 'resolved' if d['status'] == 'resolved' else ('reconciled' if d['is_reconciled'] else ('waived' if c.active_waiver else '')) }}">
     <div>
       <b>【{{ field_labels[d['field']] }}】</b>
       <span class="badge b-{{ d['status'] }}">{{ status_labels[d['status']] }}</span>
       {% if d['is_reconciled'] and d['status'] != 'resolved' %}
+        {% if d['close_reason'] == 'tolerated' %}
+        <span class="badge b-reconciled">≒ 容差内一致（规则 v{{ d['rule_version'] }}），待确认</span>
+        {% else %}
         <span class="badge b-reconciled">✓ 已核对一致</span>
+        {% endif %}
+      {% endif %}
+      {% if c.active_waiver %}
+        <span class="badge b-waived">🛇 限时豁免中（至 {{ c.active_waiver['expires_at'].replace('T',' ') }}）</span>
       {% endif %}
       {% if d['owner'] %}<span class="muted">负责人：{{ d['owner'] }}</span>{% endif %}
+      <span class="muted">· 风险轮次 第 {{ d['episode'] }} 轮</span>
     </div>
     <div class="vals">
       <table>
@@ -155,6 +278,58 @@
         </tr>
       </table>
     </div>
+    {% if d['is_reconciled'] and d['close_reason'] == 'tolerated' and c.rule_evidence %}
+    <div class="tolerance-hit">
+      命中依据：规则 v{{ d['rule_version'] }}
+      {% if c.rule_evidence.get('mode') == 'abs' %}
+        绝对偏差 {{ c.rule_evidence['spread'] }} ≤ 允许 ±{{ c.rule_evidence['limit'] }}；
+      {% elif c.rule_evidence.get('mode') == 'pct' %}
+        相对偏差 {{ c.rule_evidence['ratio_pct'] }}%（按{{ c.rule_evidence['basis_desc'] }} {{ c.rule_evidence['base'] }}，差 {{ c.rule_evidence['spread'] }}）≤ 允许 ±{{ c.rule_evidence['limit_pct_input'] }}%；
+      {% elif c.rule_evidence.get('mode') == 'alias' %}
+        同属别名组「{{ (c.rule_evidence['group'] or [])|join(' / ') }}」；
+      {% endif %}
+      申报采用「{{ source_labels.get(c.rule_evidence.get('adopt_source'), c.rule_evidence.get('adopt_source')) }}」值
+      「{{ c.rule_evidence.get('adopted_value') }}」。原始三方值已原样保留。
+    </div>
+    {% endif %}
+    {% if c.active_waiver %}
+    <div class="waiver-box">
+      <b>限时豁免（豁免期内不催办）</b><br>
+      原因：{{ c.active_waiver['reason'] }}<br>
+      <span class="muted">批准人：{{ c.active_waiver['granted_by'] }} ·
+        批准于 {{ c.active_waiver['granted_at'] }} ·
+        到期 {{ c.active_waiver['expires_at'].replace('T',' ') }} ·
+        依据第 {{ c.active_waiver['episode'] }} 轮差异（规则版本
+        {{ (c.active_waiver['basis_json']|from_json).get('rule_version') or '严格比对' }}）</span>
+      {% if d['status'] != 'resolved' and not d['is_reconciled'] %}
+      <form class="inline" method="post" action="{{ url_for('revoke_waiver', waiver_id=c.active_waiver['id']) }}"
+            onsubmit="return confirm('撤销后若仍有冲突，将立即复用本差异行开启新一轮提醒，确定？');" style="margin-top:6px">
+        <input type="hidden" name="actor" value="">
+        <button type="submit" class="ghost" style="padding:3px 10px">提前撤销豁免</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% if c.waivers and (not c.active_waiver or (c.waivers|length > 1)) %}
+    <details class="muted" style="margin:6px 0">
+      <summary style="cursor:pointer">豁免历史（{{ c.waivers|length }} 条）</summary>
+      <table style="margin-top:6px;font-size:12px">
+        <tr><th>批准/原因</th><th>到期</th><th>状态</th></tr>
+        {% for w in c.waivers %}
+        <tr>
+          <td>{{ w['granted_at'] }} {{ w['granted_by'] }}：{{ w['reason'] }}</td>
+          <td>{{ w['expires_at'].replace('T',' ') }}</td>
+          <td>
+            {% if w['status']=='active' %}<span class="badge b-waived">豁免中</span>
+            {% elif w['status']=='expired' %}<span class="badge b-open">已到期{% if d['status']!='resolved' and not d['is_reconciled'] and w['episode']==d['episode']-1 %}·已重开{% endif %}</span>
+            {% elif w['status']=='revoked' %}<span class="badge b-open">已撤销（{{ w['revoked_by'] }}）</span>
+            {% else %}<span class="badge b-claimed">重核后冲突消失，自动终结</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </details>
+    {% endif %}
     {% if d['supplement_note'] %}
     <div style="font-size:13px;margin:6px 0"><b>补件记录：</b><pre style="white-space:pre-wrap;margin:4px 0;font-family:inherit">{{ d['supplement_note'] }}</pre></div>
     {% endif %}
@@ -191,6 +366,22 @@
           <button type="submit" class="ghost">补件</button>
         </div>
       </form>
+      {% if not c.active_waiver %}
+      <details class="grow waiver-apply">
+        <summary class="muted" style="cursor:pointer">现场需限时放行？申请豁免（原因/操作人/到期必填）</summary>
+        <form method="post" action="{{ url_for('grant_waiver', discrepancy_id=d['id']) }}" style="margin-top:8px">
+          <div class="grid g2">
+            <div><label>豁免原因 *</label><input name="reason" required placeholder="如 海关允许短装，船期不等人，先放行后补正"></div>
+            <div><label>到期时间 *</label><input type="datetime-local" name="expires_at" required></div>
+            <div><label>操作人 *</label><input name="granted_by" required value="{{ d['owner'] or '' }}" placeholder="批准人姓名"></div>
+            <div style="display:flex;align-items:flex-end">
+              <button type="submit" class="ghost">批准限时豁免</button>
+            </div>
+          </div>
+          <p class="muted" style="margin:6px 0 0">豁免期间提醒服务不再催办；到期、撤销或资料升版后若仍有冲突，自动复用本该差异行开启新 episode 并恢复提醒。</p>
+        </form>
+      </details>
+      {% endif %}
       {% if d['is_reconciled'] %}
       <form class="inline" method="post" action="{{ url_for('resolve', discrepancy_id=d['id']) }}">
         <label>&nbsp;</label>
@@ -253,7 +444,7 @@
 
 <div class="card">
   <h2>申报包冻结与导出（不可变快照）</h2>
-  <p class="muted" style="margin-top:0">冻结会把<b>当前采用的三方资料版本</b>（含提交人、提交时间）和<b>全部差异处理结论</b>（负责人、补件、留痕、风险提示）固化为一个申报包。冻结后三方再提交新版本，本包内容不会改变；需要新快照时再冻结下一包。</p>
+  <p class="muted" style="margin-top:0">冻结会把<b>当前采用的三方资料版本</b>（含提交人、提交时间）、<b>容差规则版本链与命中依据</b>、<b>豁免证据</b>（原因、操作人、到期、批准时的三方值）和<b>全部差异处理结论</b>固化为一个申报包。冻结后改规则/改资料都不影响本包；需要新快照时再冻下一包。豁免期内的差异不算“未解决”，可直接冻结。</p>
   <form method="post" action="{{ url_for('freeze_package', shipment_id=s['id']) }}">
     <div class="actions">
       <div class="grow"><label>冻结操作人</label><input name="actor" placeholder="姓名"></div>

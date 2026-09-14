@@ -28,6 +28,14 @@
     .b-claimed { background:var(--amber-bg); color:var(--amber); }
     .b-resolved { background:var(--green-bg); color:var(--green); }
     .b-reconciled { background:var(--green-bg); color:var(--green); border:1px solid var(--green); }
+    .b-waived { background:#eef0fb; color:#4454a8; border:1px solid #4454a8; }
+    .rule-block { border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:10px; }
+    .rule-head { font-size:14px; }
+    .tolerance-hit { font-size:12.5px; color:var(--green); background:var(--green-bg);
+                     border-radius:5px; padding:6px 10px; margin:6px 0; }
+    .waiver-box { font-size:13px; background:#eef0fb; border:1px dashed #4454a8;
+                  border-radius:6px; padding:8px 10px; margin:6px 0; color:#2c3a78; }
+    .waiver-apply summary { font-size:13px; padding:6px 0; }
     input,select,textarea { width:100%; padding:7px 9px; border:1px solid var(--line);
             border-radius:5px; font-size:14px; font-family:inherit; }
     textarea { min-height:52px; }
@@ -48,6 +56,7 @@
     .disc { border:1px solid var(--line); border-left:4px solid var(--red); border-radius:6px;
             padding:14px 16px; margin-bottom:14px; background:#fff; }
     .disc.reconciled { border-left-color:var(--green); background:var(--green-bg); }
+    .disc.waived { border-left-color:#4454a8; background:#f5f6fd; }
     .disc.resolved { border-left-color:#9aa5b1; background:#f7f9fb; }
     .disc .vals { margin:8px 0; font-size:13px; }
     .disc .vals table { margin-top:6px; }

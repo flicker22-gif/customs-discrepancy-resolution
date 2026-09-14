@@ -508,6 +508,429 @@ class PackageTest(unittest.TestCase):
         self.assertIn("package_frozen", actions)
 
 
+class ToleranceRuleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "tol.db"))
+        core.init_db(self.conn)
+        self.sid = core.create_shipment(self.conn, "TOL-1", actor="t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _qty_conflict(self, a="1000", b="1020", c="1000"):
+        core.submit_document(self.conn, self.sid, "supplier", "保温杯", a, "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "保温杯", b, "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "warehouse", "保温杯", c, "C1", actor="t")
+
+    def _disc(self, field="quantity"):
+        return next(d for d in core.list_discrepancies(self.conn, self.sid)
+                    if d["field"] == field)
+
+    # ---- 判定 ----
+    def test_rule_before_conflict_within_abs_no_discrepancy(self):
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="关务")
+        self._qty_conflict()
+        self.assertEqual(core.list_discrepancies(self.conn, self.sid), [])
+        actions = [l["action"] for l in core.list_logs(self.conn, self.sid)]
+        self.assertIn("discrepancy_tolerated", actions)
+
+    def test_rule_after_conflict_within_abs_marks_tolerated_with_evidence(self):
+        self._qty_conflict()
+        d = self._disc()
+        self.assertEqual(d["rule_version"], None)
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="关务")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 1)
+        self.assertEqual(d["close_reason"], core.CLOSE_TOLERATED)
+        self.assertEqual(d["rule_version"], 1)
+        ev = __import__("json").loads(d["rule_evidence_json"])
+        self.assertEqual((ev["spread"], ev["limit"]), ("20", "50"))
+        # 容差内即可确认解决，无需改值
+        core.resolve_discrepancy(self.conn, d["id"], actor="关务")
+        self.assertEqual(self._disc()["status"], "resolved")
+
+    def test_rule_exceeded_stays_open(self):
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "10"}, actor="关务")
+        self._qty_conflict()
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 0)
+        self.assertIsNone(d["close_reason"])
+        with self.assertRaises(ValueError):
+            core.resolve_discrepancy(self.conn, d["id"], actor="关务")
+
+    def test_pct_tolerance_boundary_inclusive(self):
+        present = {s: {"raw": v, "norm": core.NORMALIZERS["quantity"](v)}
+                   for s, v in zip(core.SOURCES, ["1000", "1020", "1000"])}
+        hit = core.evaluate_tolerance("quantity", "pct", {"pct": "2", "basis": "max"}, present)
+        self.assertIsNotNone(hit)                       # 恰好 2.00%，≤ 即命中
+        present["forwarder"] = {"raw": "1021", "norm": "1021"}
+        self.assertIsNone(core.evaluate_tolerance(
+            "quantity", "pct", {"pct": "2", "basis": "max"}, present))
+
+    def test_alias_tolerance_text(self):
+        core.save_rule(self.conn, self.sid, "product_name", "alias",
+                       {"aliases": "不锈钢保温杯/保温杯"}, actor="关务")
+        core.submit_document(self.conn, self.sid, "supplier", "保温杯", "1000", "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "不锈钢保温杯", "1000", "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "warehouse", "保温杯", "1000", "C1", actor="t")
+        self.assertEqual(core.list_discrepancies(self.conn, self.sid), [])
+
+    def test_non_numeric_quantity_falls_back_to_strict(self):
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "9999"}, actor="关务")
+        core.submit_document(self.conn, self.sid, "supplier", "杯", "1000", "C1", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "杯", "约1000", "C1", actor="t")
+        self.assertEqual(self._disc()["is_reconciled"], 0)
+
+    # ---- 版本化 / 收紧 / 停用 ----
+    def test_rule_version_chain_append_only(self):
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="甲")
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "10"},
+                       note="收紧", actor="乙")
+        rules = core.list_rules(self.conn, self.sid)
+        self.assertEqual([r["version"] for r in rules], [2, 1])
+        self.assertEqual([r["status"] for r in rules],
+                         [core.RULE_ACTIVE, core.RULE_SUPERSEDED])
+
+    def test_rule_tightening_reopens_tolerated_discrepancy(self):
+        self._qty_conflict()
+        d = self._disc()
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="甲")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 1)
+        core.claim_discrepancy(self.conn, d["id"], owner="小李")
+        # 收紧到 ±10：仍冲突 → 复用原行重开、进入新轮次、清空命中依据
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "10"}, actor="乙")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 0)
+        self.assertIsNone(d["close_reason"])
+        self.assertIsNone(d["rule_version"])
+        self.assertEqual(d["episode"], 2)
+        self.assertEqual(d["owner"], "小李")  # 重开不清负责人（与资料升版口径区分）
+
+    def test_rule_revoke_restores_strict_and_reopens(self):
+        self._qty_conflict()
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="甲")
+        self.assertEqual(self._disc()["is_reconciled"], 1)
+        core.revoke_rule(self.conn, self.sid, "quantity", actor="甲")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 0)
+        self.assertIsNone(d["rule_version"])
+        self.assertEqual(d["episode"], 2)
+        self.assertIsNone(core.active_rule(self.conn, self.sid, "quantity"))
+        # 版本链保留作证据
+        self.assertEqual(len(core.list_rules(self.conn, self.sid)), 1)
+
+    def test_loosening_rule_re_tolerates_and_updates_evidence_version(self):
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "10"}, actor="甲")
+        self._qty_conflict()
+        self.assertEqual(self._disc()["is_reconciled"], 0)
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "30"}, actor="甲")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 1)
+        self.assertEqual(d["close_reason"], core.CLOSE_TOLERATED)
+        self.assertEqual(d["rule_version"], 2)
+
+    def test_legacy_shipment_without_rule_stays_strict(self):
+        self._qty_conflict()
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 0)
+        self.assertIsNone(d["rule_version"])
+        self.assertEqual(__import__("json").loads(d["rule_evidence_json"]), {})
+
+    def test_invalid_rule_config_rejected(self):
+        with self.assertRaises(ValueError):
+            core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "-1"}, actor="甲")
+        with self.assertRaises(ValueError):
+            core.save_rule(self.conn, self.sid, "quantity", "pct", {"pct": "120"}, actor="甲")
+        with self.assertRaises(ValueError):
+            core.save_rule(self.conn, self.sid, "product_name", "alias",
+                           {"aliases": "只有一个别名"}, actor="甲")
+
+
+class WaiverLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "w.db"))
+        core.init_db(self.conn)
+        self.t0 = datetime(2026, 9, 15, 9, 0)
+        self.deadline = self.t0 + timedelta(hours=48)
+        self.sid = core.create_shipment(
+            self.conn, "WV-1", actor="t",
+            deadline=self.deadline.isoformat(timespec="minutes"), warn_hours=48)
+        core.submit_document(self.conn, self.sid, "supplier", "A", "1000", "C", actor="t")
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1020", "C", actor="t")
+        self.did = core.list_discrepancies(self.conn, self.sid)[0]["id"]
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _grant(self, expiry, reason="船期不等人，先放行", by="关务小李"):
+        return core.grant_waiver(self.conn, self.did, reason=reason,
+                                 granted_by=by,
+                                 expires_at=expiry.isoformat(timespec="minutes"))
+
+    def _disc(self):
+        return self.conn.execute("SELECT * FROM discrepancy WHERE id=?",
+                                 (self.did,)).fetchone()
+
+    # ---- 授予校验 ----
+    def test_grant_requires_reason_operator_future_expiry(self):
+        future = (self.t0 + timedelta(hours=2)).isoformat()
+        with self.assertRaises(ValueError):
+            core.grant_waiver(self.conn, self.did, reason="", granted_by="甲",
+                              expires_at=future)
+        with self.assertRaises(ValueError):
+            core.grant_waiver(self.conn, self.did, reason="有原因", granted_by="",
+                              expires_at=future)
+        with self.assertRaises(ValueError):
+            core.grant_waiver(self.conn, self.did, reason="有原因", granted_by="甲",
+                              expires_at="2000-01-01T00:00")
+
+    def test_grant_basis_freezes_raw_values_and_rule_version(self):
+        wid = self._grant(self.t0 + timedelta(hours=2))
+        w = core.get_waiver(self.conn, wid)
+        basis = __import__("json").loads(w["basis_json"])
+        self.assertIn("supplier", basis["values"])
+        self.assertEqual(basis["values"]["forwarder"]["raw"], "1020")
+        self.assertEqual(basis["rule_version"], None)  # 无规则 → 严格比对依据
+        self.assertEqual(self._disc()["active_waiver_id"], wid)
+
+    def test_cannot_grant_on_tolerated_or_duplicate_active(self):
+        # 容差内视为一致的差异不能豁免
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="甲")
+        self.assertEqual(self._disc()["is_reconciled"], 1)
+        with self.assertRaises(ValueError):
+            self._grant(self.t0 + timedelta(hours=2))
+        # 收紧规则重新暴露冲突后授豁免，再授第二次应拒绝
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "5"}, actor="甲")
+        self._grant(self.t0 + timedelta(hours=2))
+        with self.assertRaises(ValueError):
+            self._grant(self.t0 + timedelta(hours=4))
+
+    # ---- 豁免期静默 + 取消待发 ----
+    def test_waiver_silences_reminders_throughout_window(self):
+        self._grant(self.t0 + timedelta(hours=72))  # 有效期覆盖临近窗口与超时时刻
+        s1 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.t0 + timedelta(hours=1))
+        s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.deadline + timedelta(hours=1))
+        self.assertEqual((s1["events_new"], s2["events_new"]), (0, 0))
+        self.assertEqual(reminders.assess_shipments(self.conn, at=self.deadline), [])
+
+    def test_grant_cancels_pending_notification(self):
+        reminders.scan_once(self.conn, reminders.LogNotifier(), at=self.t0)
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM notification n JOIN reminder_event e ON n.event_id=e.id "
+            "WHERE e.discrepancy_id=? AND n.status='sent'", (self.did,)).fetchone()[0]
+        self.assertEqual(pending, 1)
+        # 再构造一条 pending：失败通知
+        flaky = reminders.FlakyNotifier(fail_times=1)
+        # 新事件需新 episode，这里直接验证授予时 pending/failed 被撤销：手工补一条 failed
+        self.conn.execute(
+            "INSERT INTO notification (event_id, channel, target, content, status, created_at) "
+            "SELECT id, 'im', '关务主管', 'x', 'pending', ? FROM reminder_event "
+            "WHERE discrepancy_id=? LIMIT 1", (core.now(), self.did))
+        self.conn.commit()
+        self._grant(self.t0 + timedelta(hours=2))
+        cancelled = self.conn.execute(
+            "SELECT COUNT(*) FROM notification n JOIN reminder_event e ON n.event_id=e.id "
+            "WHERE e.discrepancy_id=? AND n.status='cancelled'", (self.did,)).fetchone()[0]
+        self.assertEqual(cancelled, 1)
+
+    # ---- 到期重开 ----
+    def test_expiry_reopens_reuses_row_and_resumes_reminder_same_scan(self):
+        self._grant(self.t0 + timedelta(hours=2))
+        # 豁免期扫描：静默
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.t0 + timedelta(hours=1))
+        self.assertEqual(s["events_new"], 0)
+        # 到期后同一轮扫描：先重开 episode 2，再恢复提醒
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.t0 + timedelta(hours=3))
+        self.assertEqual(s["waivers_expired"], 1)
+        self.assertEqual(s["waivers_reopened"], 1)
+        self.assertEqual(s["events_new"], 1)
+        self.assertEqual(self._disc()["episode"], 2)
+        w = self.conn.execute("SELECT * FROM waiver WHERE discrepancy_id=?",
+                              (self.did,)).fetchone()
+        self.assertEqual(w["status"], core.WAIVER_EXPIRED)
+        # 再扫不重复
+        s2 = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                 at=self.t0 + timedelta(hours=4))
+        self.assertEqual((s2["events_new"], s2["waivers_expired"]), (0, 0))
+
+    def test_expiry_when_conflict_gone_does_not_bump(self):
+        self._grant(self.t0 + timedelta(hours=2))
+        # 到期前资料改齐：豁免自动终结（superseded），不 bump
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1000", "C", actor="t")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 1)
+        self.assertEqual(d["episode"], 1)
+        stats = core.expire_due_waivers(self.conn, at=self.t0 + timedelta(hours=3))
+        self.assertEqual((stats["expired"], stats["reopened"]), (0, 0))
+        w = self.conn.execute("SELECT * FROM waiver WHERE discrepancy_id=?",
+                              (self.did,)).fetchone()
+        self.assertEqual(w["status"], core.WAIVER_SUPERSEDED)
+
+    # ---- 撤销重开 ----
+    def test_manual_revoke_reopens_and_reminds(self):
+        wid = self._grant(self.t0 + timedelta(hours=20))
+        result = core.revoke_waiver(self.conn, wid, actor="关务主管")
+        self.assertTrue(result["bumped"])
+        self.assertEqual(self._disc()["episode"], 2)
+        w = core.get_waiver(self.conn, wid)
+        self.assertEqual(w["status"], core.WAIVER_REVOKED)
+        self.assertEqual(w["revoked_by"], "关务主管")
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(), at=self.t0)
+        self.assertEqual(s["events_new"], 1)  # 新 episode 恢复催办
+
+    def test_revoke_non_active_rejected(self):
+        wid = self._grant(self.t0 + timedelta(hours=20))
+        core.revoke_waiver(self.conn, wid, actor="甲")
+        with self.assertRaises(ValueError):
+            core.revoke_waiver(self.conn, wid, actor="甲")
+
+    # ---- 资料升版 ----
+    def test_doc_upgrade_still_conflicting_ends_waiver_and_bumps(self):
+        self._grant(self.t0 + timedelta(hours=20))
+        # 供应商数量变化但仍冲突（1005 vs 1020）
+        core.submit_document(self.conn, self.sid, "supplier", "A", "1005", "C", actor="t")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 0)
+        self.assertEqual(d["episode"], 2)
+        self.assertIsNone(d["active_waiver_id"])
+        w = self.conn.execute("SELECT * FROM waiver WHERE discrepancy_id=?",
+                              (self.did,)).fetchone()
+        self.assertEqual(w["status"], core.WAIVER_SUPERSEDED)
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(), at=self.t0)
+        self.assertEqual(s["events_new"], 1)
+
+    def test_doc_upgrade_aligned_ends_waiver_without_bump(self):
+        self._grant(self.t0 + timedelta(hours=20))
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1000", "C", actor="t")
+        d = self._disc()
+        self.assertEqual(d["is_reconciled"], 1)
+        self.assertEqual(d["episode"], 1)
+        self.assertIsNone(d["active_waiver_id"])
+        # 无新风险
+        s = reminders.scan_once(self.conn, reminders.LogNotifier(),
+                                at=self.deadline + timedelta(hours=1))
+        self.assertEqual(s["events_new"], 0)
+
+    def test_duplicate_submit_keeps_waiver_alive(self):
+        self._grant(self.t0 + timedelta(hours=20))
+        r = core.submit_document(self.conn, self.sid, "supplier", "A", "1000", "C", actor="t")
+        self.assertTrue(r["duplicate"])
+        self.assertIsNotNone(self._disc()["active_waiver_id"])
+
+    def test_unrelated_field_change_keeps_waiver_alive(self):
+        self._grant(self.t0 + timedelta(hours=20))
+        core.submit_document(self.conn, self.sid, "supplier", "A", "1000", "C-NEW", actor="t")
+        self.assertIsNotNone(self._disc()["active_waiver_id"])
+
+    def test_manual_recompute_keeps_active_waiver(self):
+        self._grant(self.t0 + timedelta(hours=20))
+        core.recompute(self.conn, self.sid, actor="t")  # 手动重核不传 changed_fields
+        self.assertIsNotNone(self._disc()["active_waiver_id"])
+        self.assertEqual(self._disc()["episode"], 1)
+
+    def test_new_conflict_after_superseded_waiver_reuses_row_episode3(self):
+        # 豁免→改齐(superseded, ep1)→再冲突(ep2)→再豁免→到期重开(ep3)
+        self._grant(self.t0 + timedelta(hours=20))
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1000", "C", actor="t")
+        self.assertEqual(self._disc()["episode"], 1)
+        core.submit_document(self.conn, self.sid, "forwarder", "A", "1099", "C", actor="t")
+        self.assertEqual(self._disc()["episode"], 2)
+        wid = self._grant(self.t0 + timedelta(hours=40))
+        self.assertEqual(core.get_waiver(self.conn, wid)["episode"], 2)
+        stats = core.expire_due_waivers(self.conn, at=self.t0 + timedelta(hours=41))
+        self.assertEqual(stats["reopened"], 1)
+        self.assertEqual(self._disc()["episode"], 3)
+
+
+class WaiverFreezeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conn = core.connect(os.path.join(self.tmp, "wf.db"))
+        core.init_db(self.conn)
+        self.sid = core.create_shipment(self.conn, "WF-1", actor="t",
+                                        deadline="2026-09-20T10:00", warn_hours=24)
+        for src, qty in (("supplier", "1000"), ("forwarder", "1020"), ("warehouse", "1000")):
+            core.submit_document(self.conn, self.sid, src, "保温杯", qty, "C1", actor="t")
+        self.did = next(d["id"] for d in core.list_discrepancies(self.conn, self.sid)
+                        if d["field"] == "quantity")
+        # 无规则严格比对下仍冲突 → 可豁免；规则在各用例里按需配置
+        self.wid = core.grant_waiver(
+            self.conn, self.did, reason="海关允许短装，限时放行",
+            granted_by="关务小李", expires_at="2026-09-21T18:00")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_waived_open_item_does_not_block_freeze(self):
+        # 豁免中的差异不算未解决：无需 confirm
+        r = core.freeze_package(self.conn, self.sid, actor="关务小李")
+        self.assertEqual((r["open_items"],), (0,))
+        pkg = core.get_package(self.conn, core.list_packages(self.conn, self.sid)[0]["id"])
+        self.assertEqual(pkg["waived_items"], 1)
+
+    def test_package_holds_rule_and_waiver_evidence(self):
+        # 配一个不覆盖当前差异（差 20 > ±10）的规则：豁免继续有效，规则版本链随包固化
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "10"}, actor="关务")
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT active_waiver_id FROM discrepancy WHERE id=?", (self.did,)).fetchone()[0])
+        core.freeze_package(self.conn, self.sid, actor="关务小李")
+        pkg = core.get_package(self.conn, core.list_packages(self.conn, self.sid)[0]["id"])
+        rules = pkg["tolerance_rules"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual((rules[0]["version"], rules[0]["mode"], rules[0]["status"]),
+                         (1, "abs", core.RULE_ACTIVE))
+        d = next(x for x in pkg["discrepancies"] if x["field"] == "quantity")
+        w = next(x for x in d["waivers"] if x["id"] == self.wid)
+        self.assertEqual(w["reason"], "海关允许短装，限时放行")
+        self.assertEqual(w["granted_by"], "关务小李")
+        self.assertEqual(w["status"], core.WAIVER_ACTIVE)
+        self.assertEqual(w["basis"]["values"]["forwarder"]["raw"], "1020")
+        self.assertTrue(any("限时豁免期内" in x for x in pkg["warnings"]))
+
+    def test_frozen_evidence_immutable_after_rule_change_and_revoke(self):
+        core.freeze_package(self.conn, self.sid, actor="关务小李")
+        pid = core.list_packages(self.conn, self.sid)[0]["id"]
+        before = core.get_package(self.conn, pid)
+        # 冻结后：撤销豁免、规则收紧出新版本、停用规则、资料升版——旧包字节级不变
+        core.revoke_waiver(self.conn, self.wid, actor="别人")
+        core.save_rule(self.conn, self.sid, "quantity", "abs", {"abs": "50"}, actor="别人")
+        core.revoke_rule(self.conn, self.sid, "quantity", actor="别人")
+        core.submit_document(self.conn, self.sid, "forwarder", "保温杯", "1099", "C1", actor="t")
+        after = core.get_package(self.conn, pid)
+        self.assertEqual(after, before)
+        frozen_d = next(x for x in after["discrepancies"] if x["field"] == "quantity")
+        frozen_w = frozen_d["waivers"][0]
+        self.assertEqual(frozen_w["status"], core.WAIVER_ACTIVE)  # 撤销不改写包内证据
+        self.assertEqual(after["tolerance_rules"], [])             # 冻结时无规则，后来配的不进包
+
+    def test_tolerated_adopt_source_in_package(self):
+        core.revoke_waiver(self.conn, self.wid, actor="关务小李")
+        # 货代改到 1008（与 1000 差 8），规则 ±10 且采用货代值
+        core.save_rule(self.conn, self.sid, "quantity", "abs",
+                       {"abs": "10", "adopt_source": "forwarder"}, actor="关务")
+        core.submit_document(self.conn, self.sid, "forwarder", "保温杯", "1008", "C1", actor="t")
+        core.freeze_package(self.conn, self.sid, actor="关务小李")
+        pkg = core.get_package(self.conn, core.list_packages(self.conn, self.sid)[0]["id"])
+        entry = pkg["declared_fields"]["quantity"]
+        self.assertEqual(entry["adoption_basis"], core.CLOSE_TOLERATED)
+        self.assertEqual(entry["adopted_value"], "1008")
+        self.assertEqual(entry["basis_sources"], ["forwarder"])
+        d = next(x for x in pkg["discrepancies"] if x["field"] == "quantity")
+        self.assertEqual(d["close_reason"], core.CLOSE_TOLERATED)
+        self.assertEqual(d["rule_version"], 1)
+        md = core.export_markdown(pkg)
+        self.assertIn("容差规则 v", md)
+        self.assertIn("豁免记录", md)
+        self.assertIn("海关允许短装", md)
+
+
 class FlaskSmokeTest(unittest.TestCase):
     def setUp(self):
         os.environ["CUSTOMS_DB"] = os.path.join(tempfile.mkdtemp(), "http.db")
@@ -559,6 +982,77 @@ class FlaskSmokeTest(unittest.TestCase):
             self.client.post(f"/discrepancies/{did}/resolve", data={"actor": "李"})
         page = self.client.get(f"/shipments/{sid}").get_data(as_text=True)
         self.assertIn("已完结", page)
+
+
+class ToleranceWaiverFlaskTest(unittest.TestCase):
+    def setUp(self):
+        os.environ["CUSTOMS_DB"] = os.path.join(tempfile.mkdtemp(), "tw.db")
+        import app as flask_app
+        self.app = flask_app.app
+        self.client = flask_app.app.test_client()
+
+    def test_rule_waiver_freeze_http_flow(self):
+        c = self.client
+        c.post("/shipments/new", data={"ref": "WEB-TW", "actor": "林"})
+        sid = 1
+        for src, qty in (("supplier", "1000"), ("forwarder", "1020"),
+                         ("warehouse", "1000")):
+            c.post(f"/shipments/{sid}/documents",
+                   data={"source": src, "product_name": "保温杯", "quantity": qty,
+                         "carton_no": "C1", "actor": "王"})
+        page = c.get(f"/shipments/{sid}").get_data(as_text=True)
+        self.assertIn("不一致", page)
+        self.assertIn("容差规则", page)
+
+        # 规则过窄 → 仍是不一致；放宽后容差内待确认
+        r = c.post(f"/shipments/{sid}/rules",
+                   data={"field": "quantity", "qty_mode": "abs", "abs": "10",
+                         "adopt_source": "supplier", "actor": "关务"},
+                   follow_redirects=True)
+        self.assertIn("v1", r.get_data(as_text=True))
+        self.assertIn("不一致", r.get_data(as_text=True))
+        r = c.post(f"/shipments/{sid}/rules",
+                   data={"field": "quantity", "qty_mode": "abs", "abs": "50",
+                         "adopt_source": "supplier", "actor": "关务"},
+                   follow_redirects=True)
+        self.assertIn("容差内一致（v2），待确认", r.get_data(as_text=True))
+
+        # 停用规则 → 恢复严格，差异重新打开
+        r = c.post(f"/shipments/{sid}/rules/revoke",
+                   data={"field": "quantity", "actor": "关务"},
+                   follow_redirects=True)
+        self.assertIn("✗ 不一致", r.get_data(as_text=True))
+
+        # 缺字段的豁免申请被拒（400 业务错误→flash 重定向）
+        r = c.post("/discrepancies/1/waivers",
+                   data={"reason": "", "granted_by": "", "expires_at": ""},
+                   follow_redirects=True)
+        self.assertIn("豁免必须填写原因", r.get_data(as_text=True))
+
+        # 完整豁免 → 页面显示豁免中、不催办
+        r = c.post("/discrepancies/1/waivers",
+                   data={"reason": "船期不等人", "granted_by": "关务小李",
+                         "expires_at": "2026-12-31T18:00"},
+                   follow_redirects=True)
+        page = r.get_data(as_text=True)
+        self.assertIn("限时豁免中", page)
+        self.assertIn("船期不等人", page)
+        self.assertIn("第 2 轮", page)
+
+        # 豁免中可直接冻结，包导出含规则/豁免证据
+        r = c.post(f"/shipments/{sid}/packages",
+                   data={"actor": "关务小李"}, follow_redirects=True)
+        self.assertIn("已冻结", r.get_data(as_text=True))
+        md = c.get("/packages/1/export.md").get_data(as_text=True)
+        self.assertIn("豁免记录", md)
+        self.assertIn("船期不等人", md)
+        blob = c.get("/packages/1/export.json").get_data(as_text=True)
+        self.assertIn("tolerance_rules", blob)
+
+        # 撤销豁免 → 提示重开新一轮
+        r = c.post("/waivers/1/revoke", data={"actor": "关务主管"},
+                   follow_redirects=True)
+        self.assertIn("已复用原差异行开启新一轮提醒", r.get_data(as_text=True))
 
 
 if __name__ == "__main__":

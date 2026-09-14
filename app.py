@@ -11,6 +11,7 @@ import core
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-customs-discrepancy")
+app.jinja_env.filters["from_json"] = json.loads
 
 
 def db():
@@ -46,9 +47,14 @@ def index():
             "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? "
             "AND status != 'resolved' AND is_reconciled = 1",
             (s["id"],)).fetchone()[0]
+        waived_n = db().execute(
+            "SELECT COUNT(*) FROM discrepancy WHERE shipment_id = ? "
+            "AND status != 'resolved' AND is_reconciled = 0 AND active_waiver_id IS NOT NULL",
+            (s["id"],)).fetchone()[0]
         dl = core.parse_dt(s["deadline"])
-        overdue = bool(open_n and dl and datetime.now() > dl)
-        summary[s["id"]] = {"open": open_n, "reconciled": reconciled_n, "overdue": overdue}
+        overdue = bool((open_n - waived_n) and dl and datetime.now() > dl)
+        summary[s["id"]] = {"open": open_n, "reconciled": reconciled_n,
+                            "waived": waived_n, "overdue": overdue}
     return render_template("index.html", shipments=rows, summary=summary,
                            status_labels={"open": "处理中", "resolved": "已完结"})
 
@@ -90,7 +96,7 @@ def update_deadline(shipment_id):
 # ---------------------------------------------------------------- 一票货详情
 
 def _field_table(conn, shipment_id):
-    """组装三方 × 三字段对照表，并标出每个单元格的冲突情况。"""
+    """组装三方 × 三字段对照表，并标出每个单元格的冲突/容差命中情况。"""
     docs = {r["source"]: r for r in core.list_documents(conn, shipment_id)}
     discrepancies = {r["field"]: r for r in core.list_discrepancies(conn, shipment_id)}
 
@@ -99,12 +105,29 @@ def _field_table(conn, shipment_id):
         present = {src: docs[src][field] for src in core.SOURCES
                    if src in docs and docs[src][field] not in (None, "")}
         norms = {core.NORMALIZERS[field](v) for v in present.values()}
-        conflict = len(norms) >= 2
+        strict_conflict = len(norms) >= 2
+        tolerated = False
+        rule_hit = None
+        if strict_conflict:
+            rule = core.active_rule(conn, shipment_id, field)
+            if rule is not None:
+                snap_present = {src: {"raw": present[src], "norm": core.NORMALIZERS[field](present[src])}
+                                for src in present}
+                hit = core.evaluate_tolerance(
+                    field, rule["mode"], core.rule_config(rule), snap_present)
+                if hit:
+                    tolerated = True
+                    rule_hit = {"version": rule["version"], "evidence": hit,
+                                "mode": rule["mode"],
+                                "config": core.rule_config(rule)}
         d = discrepancies.get(field)
         table.append({
             "field": field,
             "label": core.FIELD_LABELS[field],
-            "conflict": conflict,
+            "conflict": strict_conflict and not tolerated,
+            "strict_conflict": strict_conflict,
+            "tolerated": tolerated,
+            "rule_hit": rule_hit,
             "discrepancy": d,
             "cells": [{
                 "source": src,
@@ -121,29 +144,48 @@ def _field_table(conn, shipment_id):
 def detail(shipment_id):
     conn = db()
     shipment = core.get_shipment(conn, shipment_id)
+    # 页面加载时惰性处理到期豁免（幂等）：到期仍冲突的差异复用原行 episode+1
+    core.expire_due_waivers(conn)
     docs, table, discrepancies = _field_table(conn, shipment_id)
 
     cards = []
     for d in core.list_discrepancies(conn, shipment_id):
+        active_waiver = None
+        if d["active_waiver_id"]:
+            w = conn.execute("SELECT * FROM waiver WHERE id = ?",
+                             (d["active_waiver_id"],)).fetchone()
+            if w and w["status"] == core.WAIVER_ACTIVE:
+                active_waiver = w
         cards.append({
             "row": d,
             "values": json.loads(d["values_json"]),
+            "rule_evidence": json.loads(d["rule_evidence_json"] or "{}"),
+            "active_waiver": active_waiver,
+            "waivers": core.list_waivers(conn, discrepancy_id=d["id"]),
         })
     logs = core.list_logs(conn, shipment_id)
     tokens = core.list_tokens(conn, shipment_id)
     packages = core.list_packages(conn, shipment_id)
+    rules = core.list_rules(conn, shipment_id)
+    rule_current = {}
+    rule_history = {}
+    for r in rules:
+        if r["status"] == core.RULE_ACTIVE:
+            rule_current[r["field"]] = r
+        rule_history.setdefault(r["field"], []).append(r)
     reminder_rows = list(conn.execute(
         """SELECT e.*, n.target, n.status AS nstatus, n.attempts
            FROM reminder_event e JOIN notification n ON n.event_id = e.id
            WHERE e.shipment_id = ? ORDER BY e.id DESC, n.id""",
         (shipment_id,)))
-    # 截止时间风险状态（与 reminders.py 同一判定口径）
+    # 截止时间风险状态（与 reminders.py 同一判定口径，豁免期内不报警）
     deadline_risk = _deadline_risk(shipment, cards)
     return render_template(
         "detail.html",
         s=shipment, docs=docs, table=table, cards=cards, logs=logs,
         tokens=tokens, packages=packages, reminders=reminder_rows,
         deadline_risk=deadline_risk,
+        rules=rules, rule_current=rule_current, rule_history=rule_history,
         sources=core.SOURCES, source_labels=core.SOURCE_LABELS,
         field_labels=core.FIELD_LABELS,
         status_labels={"open": "待认领", "claimed": "处理中", "resolved": "已解决"},
@@ -154,7 +196,8 @@ def _deadline_risk(shipment, cards):
     dl = core.parse_dt(shipment["deadline"])
     if dl is None:
         return None
-    unresolved = [c for c in cards if c["row"]["status"] != "resolved"]
+    unresolved = [c for c in cards if c["row"]["status"] != "resolved"
+                  and not c["active_waiver"]]
     if not unresolved:
         return None
     from datetime import datetime, timedelta
@@ -246,6 +289,93 @@ def resolve(discrepancy_id):
         flash("差异已标记为解决", "ok")
     except Exception as e:
         flash(f"解决失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=sid))
+
+
+# ------------------------------------------------------------ 容差规则（版本化）
+
+def _rule_form_to_config(field: str, form) -> tuple[str, dict]:
+    """把规则表单解析为 (mode, config)；参数不合法抛 ValueError。"""
+    if field == "quantity":
+        mode = form.get("qty_mode", "abs")
+        config = {"adopt_source": form.get("adopt_source", "supplier")}
+        if mode == "pct":
+            config["basis"] = form.get("basis", "max")
+            config["pct"] = form.get("pct", "").strip()
+        else:
+            config["abs"] = form.get("abs", "").strip()
+        return mode, config
+    mode = "alias"
+    return mode, {
+        "aliases": form.get("aliases", ""),
+        "adopt_source": form.get("adopt_source", "supplier"),
+    }
+
+
+@app.route("/shipments/<int:shipment_id>/rules", methods=["POST"])
+def save_rule(shipment_id):
+    field = request.form.get("field", "")
+    try:
+        mode, config = _rule_form_to_config(field, request.form)
+        version = core.save_rule(
+            db(), shipment_id, field=field, mode=mode, config=config,
+            note=request.form.get("note", ""), actor=request.form.get("actor", ""))
+        flash(f"容差规则【{core.FIELD_LABELS.get(field, field)}】v{version} 已生效"
+              "（旧版本保留为证据），并已按新规则重新核对", "ok")
+    except Exception as e:
+        flash(f"规则保存失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
+
+
+@app.route("/shipments/<int:shipment_id>/rules/revoke", methods=["POST"])
+def revoke_rule(shipment_id):
+    field = request.form.get("field", "")
+    try:
+        core.revoke_rule(db(), shipment_id, field=field,
+                         actor=request.form.get("actor", ""))
+        flash(f"容差规则【{core.FIELD_LABELS.get(field, field)}】已停用，该字段恢复严格比对并重核", "ok")
+    except Exception as e:
+        flash(f"停用失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=shipment_id))
+
+
+# ------------------------------------------------------------ 豁免（限时放行）
+
+@app.route("/discrepancies/<int:discrepancy_id>/waivers", methods=["POST"])
+def grant_waiver(discrepancy_id):
+    conn = db()
+    row = conn.execute("SELECT shipment_id FROM discrepancy WHERE id = ?",
+                       (discrepancy_id,)).fetchone()
+    sid = row["shipment_id"] if row else None
+    try:
+        wid = core.grant_waiver(
+            conn, discrepancy_id,
+            reason=request.form.get("reason", ""),
+            granted_by=request.form.get("granted_by", ""),
+            expires_at=request.form.get("expires_at", ""))
+        flash(f"豁免 #{wid} 已生效：豁免期内不再催办；到期、撤销或资料升版后若仍冲突，将自动重开提醒", "ok")
+    except Exception as e:
+        flash(f"豁免申请失败：{e}", "error")
+    return redirect(url_for("detail", shipment_id=sid))
+
+
+@app.route("/waivers/<int:waiver_id>/revoke", methods=["POST"])
+def revoke_waiver(waiver_id):
+    conn = db()
+    try:
+        w = core.get_waiver(conn, waiver_id)
+        sid = w["shipment_id"]
+    except LookupError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    try:
+        result = core.revoke_waiver(conn, waiver_id, actor=request.form.get("actor", ""))
+        if result["bumped"]:
+            flash("豁免已撤销：差异仍未一致，已复用原差异行开启新一轮提醒", "ok")
+        else:
+            flash("豁免已撤销（差异当前已一致，无需重开）", "ok")
+    except Exception as e:
+        flash(f"撤销失败：{e}", "error")
     return redirect(url_for("detail", shipment_id=sid))
 
 

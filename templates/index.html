@@ -27,7 +27,10 @@
       <td>{{ s['customer'] }}</td>
       <td>
         {% if summary[s['id']]['open'] %}
-          <span class="badge b-open">{{ summary[s['id']]['open'] }} 处待处理</span>
+          <span class="badge b-open">{{ summary[s['id']]['open'] - summary[s['id']]['waived'] }} 处待处理</span>
+          {% if summary[s['id']]['waived'] %}
+            <span class="badge b-claimed">{{ summary[s['id']]['waived'] }} 处豁免中</span>
+          {% endif %}
           {% if summary[s['id']]['reconciled'] %}
             <span class="badge b-reconciled">{{ summary[s['id']]['reconciled'] }} 处待确认</span>
           {% endif %}

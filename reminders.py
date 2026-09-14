@@ -70,6 +70,8 @@ def assess_shipments(conn: sqlite3.Connection, at: datetime | None = None) -> li
     """找出当前处于风险窗口、且有未解决差异的货票及每条差异应处的提醒级别。
 
     返回 [{"shipment": row, "deadline": dt, "level": ..., "discrepancies": [row...]}]
+
+    两类差异不构成风险：已核对一致（仅待人工确认解决）；处于有效豁免期内（限时放行）。
     """
     at = at or datetime.now()
     result = []
@@ -80,10 +82,10 @@ def assess_shipments(conn: sqlite3.Connection, at: datetime | None = None) -> li
         if at < dl - timedelta(hours=int(s["warn_hours"])):
             continue  # 还没进入提醒窗口
         level = LEVEL_OVERDUE if at > dl else LEVEL_DUE_SOON
-        # 已核对一致（仅待人工确认解决）的差异不再构成风险，不产生新的提醒/升级
         discs = list(conn.execute(
             "SELECT * FROM discrepancy WHERE shipment_id = ? "
-            "AND status != 'resolved' AND is_reconciled = 0 ORDER BY id",
+            "AND status != 'resolved' AND is_reconciled = 0 "
+            "AND active_waiver_id IS NULL ORDER BY id",
             (s["id"],)))
         if not discs:
             continue
@@ -107,11 +109,19 @@ def scan_once(conn: sqlite3.Connection, notifier: Notifier,
     """扫描一轮：去重产生提醒事件 → 投递通知（新事件+失败重试）。
 
     escalation_target: 超时升级联系人（未认领差异的临近提醒也兜底发给他）。
-    统计 {"events_new": n, "notified": n, "failed": n, "retried_ok": n, "suppressed": n}
+    统计 {"events_new", "notified", "failed", "retried_ok", "suppressed",
+          "waivers_expired", "waivers_reopened"}
     """
     at = at or datetime.now()
     target_name = _clean_target(escalation_target)
-    stats = {"events_new": 0, "notified": 0, "failed": 0, "retried_ok": 0, "suppressed": 0}
+    stats = {"events_new": 0, "notified": 0, "failed": 0, "retried_ok": 0, "suppressed": 0,
+             "waivers_expired": 0, "waivers_reopened": 0}
+
+    # 先做豁免到期重开：到期且仍冲突的差异复用原行 episode+1，
+    # 随后同一轮扫描即按新 episode 恢复提醒（豁免期内完全静默）。
+    expired = core.expire_due_waivers(conn, at=at)
+    stats["waivers_expired"] = expired["expired"]
+    stats["waivers_reopened"] = expired["reopened"]
 
     for item in assess_shipments(conn, at):
         s, level = item["shipment"], item["level"]
@@ -247,7 +257,8 @@ def main() -> None:
         stats = scan_once(conn, notifier, escalation_target=target)
         print(f"[{core.now()}] 扫描完成（升级联系人：{target}）：新事件 {stats['events_new']}，"
               f"发出 {stats['notified']}，失败 {stats['failed']}，"
-              f"重试成功 {stats['retried_ok']}，拦截重复 {stats['suppressed']}")
+              f"重试成功 {stats['retried_ok']}，拦截重复 {stats['suppressed']}，"
+              f"豁免到期 {stats['waivers_expired']}（重开 {stats['waivers_reopened']}）")
 
     if args.loop:
         while True:
